@@ -1,0 +1,384 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import random
+import time
+import os
+
+from brain.modules.predictive_retina import PredictiveRetina
+from brain.modules.broca import BrocaModule
+from brain.modules.biology_core import NeurotransmitterSystem
+from brain.modules.amygdala import Amygdala
+from brain.modules.basal_ganglia import BasalGanglia
+from brain.modules.monitor import ResourceMonitor
+from models.ecg import ModularBrain
+from brain.modules.replay_buffer import PrioritizedReplayBuffer
+from brain.modules.cradle import Cradle
+
+class EvolutionaryBrain:
+    """
+    Biological Brain Controller.
+    Driven by Neurochemistry and Structural Biology.
+    """
+    def __init__(self, genome=None):
+        # Hyperparameters from Genome
+        if genome is None:
+            from brain.genome import Genome
+            self.genome = Genome()
+        else:
+            self.genome = genome
+            
+        if not hasattr(self.genome, 'latent_dim'):
+            self.genome.latent_dim = 256
+            
+        self.latent_dim = self.genome.latent_dim
+        self.input_size = (3 * self.genome.latent_dim) + self.genome.NON_VISUAL_INPUT_SIZE
+        self.hidden_size = self.genome.hidden_size 
+        self.action_size = 72 
+        
+        # --- Biological Core ---
+        self.chemistry = NeurotransmitterSystem()
+        self.amygdala = Amygdala()
+        self.basal_ganglia = BasalGanglia(self.action_size)
+        
+        # --- Replay Buffer (Unified System 1/2) ---
+        self.replay_buffer = PrioritizedReplayBuffer(capacity=10000)
+        self.prev_state = None
+        self.prev_action = None
+        self.prev_reward = 0.0
+        
+        # Meta-Cognition
+        self.last_action_success = True
+        self.last_confidence = 1.0
+        self.last_energy_cost = 0.0
+        
+        # --- Cognitive Modules ---
+        self.trm = ModularBrain(self.input_size, self.hidden_size, self.action_size, genome=self.genome, use_neuromodulated=True)
+        self.trm.set_plasticity(self.genome.plasticity_coefficients, self.genome.learning_rate)
+        self.retina = PredictiveRetina(latent_size=self.genome.latent_dim, genome=self.genome)
+        self.broca = BrocaModule(embedding_dim=self.genome.latent_dim, genome=self.genome)
+        self.memory = self.replay_buffer 
+        
+        # --- 8. Latent Adapter (N2N2 Alignment) ---
+        # Maps teacher embeddings (e.g. 4096) to our latent_dim (1024)
+        self.latent_adapter = nn.Sequential(
+            nn.Linear(4096, 2048),
+            nn.ReLU(),
+            nn.Linear(2048, self.latent_dim)
+        )
+        
+        # --- 9. Optimizers ---
+        self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate * 2.0)
+        
+        # --- Interface (Cradle) ---
+        self.cradle = Cradle()
+        self.monitor = ResourceMonitor()
+        
+        # Set RAM Limit
+        import psutil
+        sys_ram = psutil.virtual_memory().total / (1024 * 1024)
+        self.genome.max_ram_mb = min(12288, int(sys_ram * 0.75))
+        print(f"EvolutionaryBrain: RAM Limit set to {self.genome.max_ram_mb}MB")
+        
+        # Metrics
+        self.accumulated_reward = 0.0
+        self.accumulated_energy = 0.0
+        self.age = 0
+        self.stamina = 1.0
+        self.last_surprise = 0.0
+
+    def start(self):
+        print("Brain: Waking up...")
+        self.retina.start()
+
+    def stop(self):
+        print("Brain: Shutting down...")
+        self.retina.stop()
+
+    def reset_memory(self):
+        self.prev_action = None
+        if hasattr(self.trm, 'reset_state'):
+            self.trm.reset_state()
+
+    def decide(self, full_input_tensor, train_internal_rl=True, greedy=False, disable_reflex=False):
+        L = self.latent_dim
+        if full_input_tensor.dim() == 1:
+            full_input_tensor = full_input_tensor.unsqueeze(0)
+            
+        boosted_input = full_input_tensor.clone()
+        boosted_input[:, :3*L] *= 20.0
+        
+        chemicals = torch.tensor([
+            self.chemistry.dopamine,
+            self.chemistry.serotonin,
+            self.chemistry.norepinephrine,
+            self.chemistry.cortisol
+        ], device=boosted_input.device).unsqueeze(0)
+        
+        res = self.trm.forward(boosted_input, chemicals=chemicals, train_internal_rl=train_internal_rl)
+        logits, value, energy, flash_info = res
+        
+        surprise = getattr(self, 'last_surprise', 0.0)
+        action, used_system = self.basal_ganglia.gate_action(
+            logits, 
+            self.chemistry.dopamine, 
+            flash_info=(flash_info[0], flash_info[1]), 
+            surprise=surprise,
+            greedy=greedy
+        )
+        
+        self.last_used_system = used_system
+        return action, logits
+
+    def train_step(self, batch_size=32, distillation=False):
+        if len(self.replay_buffer) < batch_size:
+            return 0.0
+            
+        # Detach state to avoid backpropping through history (Recurrent Dynamics)
+        if hasattr(self.trm, 'detach_state'):
+            self.trm.detach_state()
+            
+        batch_data, indices, weights = self.replay_buffer.sample(batch_size)
+        states = torch.tensor(np.array([x[0] for x in batch_data]), dtype=torch.float32)
+        actions = torch.tensor(np.array([x[1] for x in batch_data]), dtype=torch.long)
+        rewards = torch.tensor(np.array([x[2] for x in batch_data]), dtype=torch.float32)
+        next_states = torch.tensor(np.array([x[3] for x in batch_data]), dtype=torch.float32)
+        dones = torch.tensor(np.array([x[4] for x in batch_data]), dtype=torch.float32)
+        weights = torch.tensor(weights, dtype=torch.float32)
+        
+        mask = rewards.abs() > 0.01
+        if mask.any():
+            states = states[mask]
+            actions = actions[mask]
+            rewards = rewards[mask]
+            next_states = next_states[mask]
+            dones = dones[mask]
+            weights = weights[mask]
+        else:
+            return 0.0
+            
+        L = self.latent_dim
+        boosted_states = states.clone()
+        boosted_states[:, :3*L] *= 20.0
+        boosted_next_states = next_states.clone()
+        boosted_next_states[:, :3*L] *= 20.0
+        
+        self.trm_optimizer.zero_grad()
+        chemicals = torch.zeros(states.shape[0], 4, device=states.device)
+        
+        # Detach state to prevent graph growth and shape mismatches from previous steps
+        self.trm.detach_state()
+        
+        res = self.trm.forward(boosted_states, chemicals=chemicals)
+        logits, value, _, (flash_logits, flash_conf, p_reflex, p_concept, p_strategy) = res
+        
+        with torch.no_grad():
+            res_next = self.trm.forward(boosted_next_states, chemicals=chemicals)
+            _, _, _, (_, _, t_reflex, t_concept, t_strategy) = res_next
+        
+        # 1. Standard RL Losses
+        policy_loss = F.cross_entropy(logits, actions)
+        flash_loss = F.cross_entropy(flash_logits, actions)
+        value_loss = F.mse_loss(value.squeeze(), rewards)
+        
+        try:
+            jepa_loss = F.mse_loss(p_reflex, t_reflex) + \
+                        F.mse_loss(p_concept, t_concept) + \
+                        F.mse_loss(p_strategy, t_strategy)
+        except RuntimeError as e:
+            print(f"DEBUG: Shape Mismatch in JEPA Loss!")
+            print(f"DEBUG: p_reflex: {p_reflex.shape}, t_reflex: {t_reflex.shape}")
+            print(f"DEBUG: p_concept: {p_concept.shape}, t_concept: {t_concept.shape}")
+            print(f"DEBUG: p_strategy: {p_strategy.shape}, t_strategy: {t_strategy.shape}")
+            raise e
+            
+        # 2. Distillation Loss (System 2 -> System 1)
+        distill_loss = 0.0
+        if distillation:
+            T = 2.0
+            p_s1 = F.log_softmax(flash_logits / T, dim=1)
+            p_s2 = F.softmax(logits / T, dim=1)
+            distill_loss = F.kl_div(p_s1, p_s2, reduction='batchmean') * (T**2)
+            
+        total_loss = policy_loss + flash_loss + value_loss + (jepa_loss * 0.1) + (distill_loss * 0.5)
+        
+        if torch.isnan(total_loss):
+            print("DEBUG: NaN Loss detected!")
+            return 0.0
+            
+        # Log shapes before backward
+        if self.accumulated_reward == 0: # Just once or periodically
+             print(f"DEBUG: Backward Pass Shapes:")
+             print(f"  logits: {logits.shape}, actions: {actions.shape}")
+             print(f"  flash_logits: {flash_logits.shape}")
+             print(f"  value: {value.shape}, rewards: {rewards.shape}")
+             print(f"  p_reflex: {p_reflex.shape}, t_reflex: {t_reflex.shape}")
+             
+        total_loss.backward()
+        self.trm_optimizer.step()
+        
+        self.last_surprise = jepa_loss.item()
+        return total_loss.item()
+
+    def get_input_vector(self, foveal_latent, peripheral_latent, semantic_latent, bio_state=None, prev_action=None):
+        if bio_state is None:
+            bio_state = torch.tensor([
+                self.chemistry.dopamine, 
+                self.chemistry.serotonin, 
+                self.chemistry.norepinephrine, 
+                self.stamina
+            ], device=foveal_latent.device)
+        elif not isinstance(bio_state, torch.Tensor):
+            bio_state = torch.tensor(bio_state, dtype=torch.float32, device=foveal_latent.device)
+            
+        last_action_vec = torch.zeros(100, device=foveal_latent.device)
+        if prev_action is not None:
+            last_action_vec[prev_action % 100] = 1.0
+        elif self.prev_action is not None:
+            last_action_vec[self.prev_action % 100] = 1.0
+            
+        full_input = torch.cat([
+            foveal_latent.flatten(),
+            peripheral_latent.flatten(),
+            semantic_latent.flatten(),
+            bio_state,
+            last_action_vec,
+            torch.zeros(self.genome.NON_VISUAL_INPUT_SIZE - 104, device=foveal_latent.device)
+        ]).unsqueeze(0)
+        
+        return full_input
+
+    def wake_cycle(self, reward=0.0):
+        img = self.retina.get_fovea()
+        foveal_latent, _ = self.retina.encode(img)
+        peripheral_latent = torch.zeros_like(foveal_latent)
+        semantic_latent = self.broca.get_current_context()
+        full_input = self.get_input_vector(foveal_latent, peripheral_latent, semantic_latent)
+        action, _ = self.decide(full_input)
+        self.cradle.execute_code(action)
+        if self.prev_state is not None:
+            self.replay_buffer.add(self.prev_state, self.prev_action, reward, full_input, False)
+        self.prev_state = full_input
+        self.prev_action = action
+        self.prev_reward = reward
+        return action
+
+    def dream(self, steps=10):
+        print(f"Brain: Dreaming (Distillation Mode) for {steps} steps...")
+        for _ in range(steps):
+            self.train_step(distillation=True)
+            
+        # --- Structural Plasticity: Check for Growth ---
+        self.check_growth_triggers()
+        
+    def check_growth_triggers(self):
+        """
+        Monitors cognitive demand and triggers neurogenesis if needed.
+        """
+        # Triggers:
+        # 1. High Surprise: Model is struggling to predict (needs more capacity)
+        # 2. High Reward: Model has found a good strategy (needs to lock it in)
+        surprise_threshold = 0.5
+        reward_threshold = 100.0
+        
+        if self.last_surprise > surprise_threshold or self.accumulated_reward > reward_threshold:
+            print(f"Brain: Growth Triggered! (Surprise: {self.last_surprise:.4f}, Reward: {self.accumulated_reward:.2f})")
+            # Expand hidden size by 10%
+            new_hidden = int(self.hidden_size * 1.1)
+            # Cap at 32k for CPU efficiency
+            new_hidden = min(new_hidden, 32768)
+            
+            if new_hidden > self.hidden_size:
+                self.trm.resize_hidden(new_hidden)
+                self.hidden_size = new_hidden
+                # Re-init optimizer for new parameters
+                self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate)
+                # Reset reward to avoid immediate re-trigger
+                self.accumulated_reward = 0.0
+
+    @staticmethod
+    def find_latest_checkpoint(directory):
+        if not os.path.exists(directory): return None
+        files = [f for f in os.listdir(directory) if f.endswith(('.pt', '.pth'))]
+        if not files: return None
+        files.sort(key=lambda x: os.path.getmtime(os.path.join(directory, x)), reverse=True)
+        return os.path.join(directory, files[0])
+
+    def save_model(self, filepath):
+        checkpoint = {
+            'version': '3.0-scaled',
+            'genome': self.genome.__dict__,
+            'trm_state': self.trm.state_dict(),
+            'retina_state': self.retina.state_dict(),
+            'broca_state': self.broca.save(),
+            'retina_size': self.retina.fovea_size,
+            'latent_dim': self.latent_dim,
+            'hidden_size': self.hidden_size
+        }
+        torch.save(checkpoint, filepath)
+
+    def load_model(self, filepath):
+        print(f"Brain: Loading model from {filepath}")
+        checkpoint = torch.load(filepath, map_location='cpu')
+        version = str(checkpoint.get('version', '2.0'))
+        
+        if 'genome' in checkpoint:
+            for k, v in checkpoint['genome'].items():
+                setattr(self.genome, k, v)
+        
+        if 'retina_size' in checkpoint:
+            self.retina.set_resolution(checkpoint['retina_size'])
+        if 'genome' in checkpoint and 'PERIPHERAL_RESOLUTION' in checkpoint['genome']:
+            self.retina.set_peripheral_resolution(checkpoint['genome']['PERIPHERAL_RESOLUTION'])
+            
+        target_hidden = checkpoint.get('hidden_size', self.hidden_size)
+        target_latent = checkpoint.get('latent_dim', self.latent_dim)
+            
+        # Resize if needed
+        if target_latent != self.latent_dim or target_hidden != self.hidden_size:
+            print(f"Brain: Schema mismatch detected (Latent: {self.latent_dim}->{target_latent}, Hidden: {self.hidden_size}->{target_hidden})")
+            print("Brain: Clearing replay buffer to avoid shape errors.")
+            self.replay_buffer = PrioritizedReplayBuffer(capacity=10000)
+            
+            if target_latent != self.latent_dim:
+                self.resize_latent(target_latent)
+            if target_hidden != self.hidden_size:
+                self.resize_hidden(target_hidden)
+        
+        # Load states
+        trm_state = checkpoint['trm_state']
+        # Strip stale activity buffers and CSR indices that might cause shape mismatch
+        keys_to_remove = [k for k in trm_state.keys() if any(x in k for x in ['activity_in', 'activity_out', 'crow_indices', 'col_indices'])]
+        for k in keys_to_remove:
+            del trm_state[k]
+            
+        self.trm.load_state_dict(trm_state, strict=False)
+        self.retina.load_state_dict(checkpoint['retina_state'], strict=False)
+        if 'broca_state' in checkpoint:
+            self.broca.load(checkpoint['broca_state'])
+            
+        print(f"Brain: Successfully loaded v{version} checkpoint.")
+
+    def resize_latent(self, new_latent_size):
+        if new_latent_size == self.latent_dim: return
+        print(f"Brain: Resizing Latent Dim {self.latent_dim} -> {new_latent_size}")
+        self.latent_dim = new_latent_size
+        self.genome.latent_dim = new_latent_size
+        self.input_size = (3 * new_latent_size) + self.genome.NON_VISUAL_INPUT_SIZE
+        self.retina.resize_latent(new_latent_size)
+        self.broca.resize_latent(new_latent_size)
+        if hasattr(self.trm, 'resize_input'):
+            self.trm.resize_input(self.input_size)
+        # Re-init optimizer for new parameters
+        self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate)
+
+    def resize_hidden(self, new_hidden_size):
+        if new_hidden_size == self.hidden_size: return
+        print(f"Brain: Resizing Hidden Size {self.hidden_size} -> {new_hidden_size}")
+        self.hidden_size = new_hidden_size
+        self.genome.hidden_size = new_hidden_size
+        if hasattr(self.trm, 'resize_hidden'):
+            self.trm.resize_hidden(new_hidden_size)
+        # Re-init optimizer for new parameters
+        self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate)

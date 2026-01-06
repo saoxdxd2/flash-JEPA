@@ -1,0 +1,422 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+class SparseLinear(nn.Module):
+    """
+    Sparse Linear Layer using CSR format for CPU efficiency.
+    W (In, Out) is stored as a sparse matrix.
+    """
+    def __init__(self, in_features, out_features, sparsity=0.99):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.sparsity = sparsity
+        
+        # Initialize sparse weights
+        num_non_zero = int(in_features * out_features * (1 - sparsity))
+        num_non_zero = max(num_non_zero, 1)
+        
+        # We store indices as a buffer and values as a parameter
+        self.register_buffer('indices', torch.randint(0, in_features, (2, num_non_zero)))
+        self.indices[1] = torch.randint(0, out_features, (num_non_zero,))
+        
+        self.values = nn.Parameter(torch.randn(num_non_zero) * (1.0 / np.sqrt(in_features)))
+        self.bias = nn.Parameter(torch.zeros(out_features))
+        
+        # CSR Cache (for CPU efficiency)
+        self.register_buffer('crow_indices', None)
+        self.register_buffer('col_indices', None)
+        
+        # Activity tracking for sprouting (Non-persistent to avoid shape mismatch on load)
+        self.register_buffer('activity_in', torch.zeros(in_features), persistent=False)
+        self.register_buffer('activity_out', torch.zeros(out_features), persistent=False)
+        
+    def forward(self, x):
+        # x: (Batch, In)
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        
+        if self.crow_indices is None or self.crow_indices.device != x.device:
+            # Reconstruct and cache CSR structure
+            indices = self.indices.to(x.device)
+            # Use detached values just to get the structure
+            W_coo = torch.sparse_coo_tensor(
+                indices, self.values.detach(), (self.in_features, self.out_features)
+            ).coalesce()
+            W_csr = W_coo.to_sparse_csr()
+            self.crow_indices = W_csr.crow_indices()
+            self.col_indices = W_csr.col_indices()
+            
+        # Reconstruct Sparse CSR Tensor using CURRENT values (Autograd friendly)
+        W = torch.sparse_csr_tensor(
+            self.crow_indices,
+            self.col_indices,
+            self.values,
+            size=(self.in_features, self.out_features),
+            device=x.device
+        )
+        
+        # res = x @ weight + bias
+        res = torch.addmm(self.bias.unsqueeze(0), x, W)
+        
+        # Track activity (Hebbian)
+        if self.training:
+            with torch.no_grad():
+                self.activity_in += x.abs().mean(0)
+                self.activity_out += res.abs().mean(0)
+                
+        return res
+
+    def sprout(self, num_new=100):
+        """Adds new connections between highly active neurons."""
+        print(f"SparseLinear: Sprouting {num_new} new connections...")
+        with torch.no_grad():
+            # Find top active in/out neurons
+            top_in = torch.topk(self.activity_in, min(num_new, self.in_features)).indices
+            top_out = torch.topk(self.activity_out, min(num_new, self.out_features)).indices
+            
+            # Create new indices
+            new_idx = torch.stack([
+                top_in[torch.randint(0, len(top_in), (num_new,))],
+                top_out[torch.randint(0, len(top_out), (num_new,))]
+            ])
+            
+            # Append to existing indices
+            self.indices = torch.cat([self.indices, new_idx.to(self.indices.device)], dim=1)
+            
+            # Initialize new values
+            new_vals = torch.randn(num_new, device=self.values.device) * 0.01
+            self.values = nn.Parameter(torch.cat([self.values, new_vals]))
+            
+            # Reset CSR cache
+            self.crow_indices = None
+            self.col_indices = None
+            # Reset activity
+            self.activity_in.zero_()
+            self.activity_out.zero_()
+
+    def prune(self, threshold=0.01):
+        """Removes connections with low weights."""
+        with torch.no_grad():
+            mask = self.values.abs() > threshold
+            if mask.any():
+                print(f"SparseLinear: Pruning {len(self.values) - mask.sum()} weak connections...")
+                self.indices = self.indices[:, mask]
+                self.values = nn.Parameter(self.values[mask])
+                # Reset CSR cache
+                self.crow_indices = None
+                self.col_indices = None
+
+    def resize(self, in_features=None, out_features=None):
+        """Resizes the layer while attempting to preserve existing weights."""
+        if in_features is None: in_features = self.in_features
+        if out_features is None: out_features = self.out_features
+        
+        if in_features == self.in_features and out_features == self.out_features:
+            return
+            
+        print(f"SparseLinear: Resizing ({self.in_features}, {self.out_features}) -> ({in_features}, {out_features})")
+        
+        # Create new indices and values
+        num_non_zero = int(in_features * out_features * (1 - self.sparsity))
+        num_non_zero = max(num_non_zero, 1)
+        
+        new_indices = torch.randint(0, in_features, (2, num_non_zero))
+        new_indices[1] = torch.randint(0, out_features, (num_non_zero,))
+        new_values = torch.randn(num_non_zero) * (1.0 / np.sqrt(in_features))
+        new_bias = torch.zeros(out_features)
+        
+        self.in_features = in_features
+        self.out_features = out_features
+        self.indices = new_indices.to(self.indices.device)
+        self.values = nn.Parameter(new_values.to(self.values.device))
+        self.bias = nn.Parameter(new_bias.to(self.bias.device))
+        
+        # Reset CSR cache
+        self.crow_indices = None
+        self.col_indices = None
+        
+        # Resize activity buffers
+        self.register_buffer('activity_in', torch.zeros(in_features, device=self.indices.device), persistent=False)
+        self.register_buffer('activity_out', torch.zeros(out_features, device=self.indices.device), persistent=False)
+
+class NeuromodulatedHolographicBrain(nn.Module):
+    """
+    Hybrid H-NH-JEPA Architecture.
+    
+    Hierarchy:
+    1. Reflex Layer (Fast, Sensory)
+    2. Concept Layer (Medium, Working Memory)
+    3. Strategy Layer (Slow, Goals/Context)
+    
+    Dynamics:
+    - Holographic Wavelet Encoder: Spatial resolution scaling.
+    - Decoder-Free JEPA: Predicts next latent state.
+    - Neuromodulated Gating: Chemicals control hierarchical flow.
+    - Sparse CSR Core: 1M+ neuron resolution on CPU.
+    """
+    def __init__(self, input_size, hidden_size, output_size, genome=None, **kwargs):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        
+        # --- 1. Holographic Wavelet Encoder ---
+        self.base_res = 16
+        self.encoder_levels = nn.ModuleList([
+            nn.Conv3d(1, 8, 3, padding=1, stride=2), 
+            nn.Conv3d(8, 16, 3, padding=1, stride=2), 
+            nn.Conv3d(16, 32, 3, padding=1, stride=2) 
+        ])
+        
+        self.encoded_size = 32 * 2 * 2 * 2 # 256
+        self.input_projection = nn.Linear(input_size, self.base_res**3)
+        
+        # --- 2. Hierarchical Dimensions ---
+        # Ensure they sum exactly to hidden_size to avoid mat1/mat2 mismatch
+        self.reflex_size = hidden_size // 4
+        self.strategy_size = hidden_size // 4
+        self.concept_size = hidden_size - (self.reflex_size + self.strategy_size)
+        
+        # --- 3. Sparse Hierarchical Core ---
+        # Level 1: Reflex (Encoded -> Reflex, Reflex -> Reflex)
+        self.W_reflex = SparseLinear(self.encoded_size, self.reflex_size)
+        self.R_reflex = SparseLinear(self.reflex_size, self.reflex_size)
+        
+        # Level 2: Concept (Reflex -> Concept, Concept -> Concept)
+        self.W_concept = SparseLinear(self.reflex_size, self.concept_size)
+        self.R_concept = SparseLinear(self.concept_size, self.concept_size)
+        
+        # Level 3: Strategy (Concept -> Strategy, Strategy -> Strategy)
+        self.W_strategy = SparseLinear(self.concept_size, self.strategy_size)
+        self.R_strategy = SparseLinear(self.strategy_size, self.strategy_size)
+        
+        # --- 4. Latent Predictors (JEPA) ---
+        self.P_reflex = SparseLinear(self.reflex_size, self.reflex_size)
+        self.P_concept = SparseLinear(self.concept_size, self.concept_size)
+        self.P_strategy = SparseLinear(self.strategy_size, self.strategy_size)
+        
+        # --- 5. Neuromodulated Gating ---
+        # Chemicals (Dopamine, Serotonin, Norepinephrine, Cortisol)
+        # Input: Encoded (256) + Chemicals (4) = 260
+        self.meta_controller = nn.Sequential(
+            nn.Linear(self.encoded_size + 4, 64),
+            nn.Tanh(),
+            nn.Linear(64, 3) # [Reflex_Gate, Concept_Gate, Strategy_Gate]
+        )
+        
+        # --- 6. Sparse MoE Routers ---
+        # Each level has a router that selects active "experts" (neurons)
+        self.router_reflex = nn.Linear(self.encoded_size, 64)
+        self.router_concept = nn.Linear(self.reflex_size, 64)
+        self.router_strategy = nn.Linear(self.concept_size, 64)
+        
+        self.top_k = 4 # Number of "Expert Blocks" to activate
+        
+        # --- 6. Temporal Dynamics (Per-neuron Tau) ---
+        self.tau_reflex = nn.Parameter(torch.rand(self.reflex_size) * 0.1 + 0.01) # 1-10ms
+        self.tau_concept = nn.Parameter(torch.rand(self.concept_size) * 0.4 + 0.1) # 100-500ms
+        self.tau_strategy = nn.Parameter(torch.rand(self.strategy_size) * 9.0 + 1.0) # 1-10s
+        
+        # --- 7. Flash Head (System 1) ---
+        # Fast action proposals from Level 1 (Reflex)
+        self.flash_head = nn.Linear(self.reflex_size, output_size)
+        self.flash_confidence = nn.Linear(self.reflex_size, 1) # Entropy/Confidence threshold
+        
+        # --- 8. Selective Decoder (System 2) ---
+        self.decoder = nn.Linear(hidden_size, output_size)
+        self.intent_gate = nn.Linear(hidden_size, 1) # Decides when to act
+        
+        # --- 9. RL Critic ---
+        self.critic = nn.Linear(hidden_size, 1)
+        
+        # State
+        self.h_reflex = None
+        self.h_concept = None
+        self.h_strategy = None
+        
+        # --- 10. Routing-Aware Initialization ---
+        self._init_routing_specialization()
+        
+    def _init_routing_specialization(self):
+        """
+        Initializes sparse weights such that different expert blocks 
+        have different 'preferences' in the input space.
+        """
+        print("NeuromodulatedHolographicBrain: Initializing Routing-Aware Specialization...")
+        with torch.no_grad():
+            # For each level, we want to ensure the router can distinguish between blocks
+            for name, module in self.named_modules():
+                if isinstance(module, SparseLinear):
+                    # Add a small block-specific bias to the sparse values
+                    # This helps the router find 'specialists' early on
+                    num_blocks = module.out_features // 64
+                    if num_blocks > 0:
+                        for b in range(num_blocks):
+                            # Find indices belonging to this block
+                            mask = (module.indices[1] >= b*64) & (module.indices[1] < (b+1)*64)
+                            # Add block-specific noise to values
+                            module.values.data[mask] += torch.randn(mask.sum()) * 0.01 * (b / num_blocks)
+        
+    def forward(self, input_vector, dt=0.1, reward=0.0, chemicals=None, train_internal_rl=True):
+        if input_vector.dim() == 1:
+            input_vector = input_vector.unsqueeze(0)
+        batch_size = input_vector.shape[0]
+        
+        # Init States
+        if self.h_reflex is None or self.h_reflex.shape[0] != batch_size or self.h_reflex.shape[1] != self.reflex_size:
+            self.h_reflex = torch.zeros(batch_size, self.reflex_size, device=input_vector.device)
+        if self.h_concept is None or self.h_concept.shape[0] != batch_size or self.h_concept.shape[1] != self.concept_size:
+            self.h_concept = torch.zeros(batch_size, self.concept_size, device=input_vector.device)
+        if self.h_strategy is None or self.h_strategy.shape[0] != batch_size or self.h_strategy.shape[1] != self.strategy_size:
+            self.h_strategy = torch.zeros(batch_size, self.strategy_size, device=input_vector.device)
+            
+        # --- 1. Holographic Encoding ---
+        x = self.input_projection(input_vector).view(batch_size, 1, self.base_res, self.base_res, self.base_res)
+        
+        features = []
+        curr = x
+        for layer in self.encoder_levels:
+            curr = F.relu(layer(curr))
+            features.append(curr.flatten(1))
+            
+        encoded_input = features[-1] 
+        
+        # --- 2. Neuromodulated Gating ---
+        if chemicals is None:
+            chemicals = torch.tensor([0.5, 0.5, 0.2, 0.0], device=input_vector.device).repeat(batch_size, 1)
+        
+        meta_input = torch.cat([encoded_input, chemicals], dim=1)
+        gates = torch.sigmoid(self.meta_controller(meta_input))
+        g_reflex, g_concept, g_strategy = torch.chunk(gates, 3, dim=1)
+        
+        # --- 3. Hierarchical Update (Bottom-Up) ---
+        
+        # Level 1: Reflex (System 1 - Flash)
+        # MoE Routing: Select active neurons
+        r_reflex = torch.sigmoid(self.router_reflex(encoded_input))
+        reflex_mask = (r_reflex > 0.5).float() # Sparse mask
+        
+        # Correctly repeat and slice mask to match reflex_size
+        full_reflex_mask = reflex_mask.repeat(1, (self.reflex_size + 63) // 64)[:, :self.reflex_size]
+        
+        sensory_reflex = self.W_reflex(encoded_input) * full_reflex_mask
+        rec_reflex = self.R_reflex(self.h_reflex)
+        target_reflex = torch.tanh(sensory_reflex + rec_reflex)
+        
+        # DEBUG: Check shapes
+        if self.h_reflex.shape[1] != self.reflex_size:
+            print(f"DEBUG: {self.__class__.__name__} h_reflex shape mismatch! {self.h_reflex.shape} vs {self.reflex_size}")
+            
+        self.h_reflex = self.h_reflex + g_reflex * (target_reflex - self.h_reflex) * (dt / self.tau_reflex)
+        reflex_mask = (r_reflex > 0.5).float() # Sparse mask
+        
+        # Correctly repeat and slice mask to match reflex_size
+        full_reflex_mask = reflex_mask.repeat(1, (self.reflex_size + 63) // 64)[:, :self.reflex_size]
+        
+        sensory_reflex = self.W_reflex(encoded_input) * full_reflex_mask
+        rec_reflex = self.R_reflex(self.h_reflex)
+        target_reflex = torch.tanh(sensory_reflex + rec_reflex)
+        
+        # DEBUG: Check shapes
+        if self.h_reflex.shape[1] != self.reflex_size:
+            print(f"DEBUG: {self.__class__.__name__} h_reflex shape mismatch! {self.h_reflex.shape} vs {self.reflex_size}")
+            
+        self.h_reflex = self.h_reflex + g_reflex * (target_reflex - self.h_reflex) * (dt / self.tau_reflex)
+        
+        # --- 4. Flash Logic (Early Exit / System 1) ---
+        # If Level 1 is confident, we can propose an action immediately
+        flash_actions = self.flash_head(self.h_reflex)
+        confidence = torch.sigmoid(self.flash_confidence(self.h_reflex))
+        
+        # --- 5. System 2 (Deep Reasoning) ---
+        # Level 2: Concept
+        r_concept = torch.sigmoid(self.router_concept(self.h_reflex))
+        concept_mask = (r_concept > 0.5).float()
+        full_concept_mask = concept_mask.repeat(1, (self.concept_size + 63) // 64)[:, :self.concept_size]
+        
+        sensory_concept = self.W_concept(self.h_reflex) * full_concept_mask
+        rec_concept = self.R_concept(self.h_concept)
+        target_concept = torch.tanh(sensory_concept + rec_concept)
+        self.h_concept = self.h_concept + g_concept * (target_concept - self.h_concept) * (dt / self.tau_concept)
+        
+        # Level 3: Strategy
+        r_strategy = torch.sigmoid(self.router_strategy(self.h_concept))
+        strategy_mask = (r_strategy > 0.5).float()
+        full_strategy_mask = strategy_mask.repeat(1, (self.strategy_size + 63) // 64)[:, :self.strategy_size]
+        
+        sensory_strategy = self.W_strategy(self.h_concept) * full_strategy_mask
+        rec_strategy = self.R_strategy(self.h_strategy)
+        target_strategy = torch.tanh(sensory_strategy + rec_strategy)
+        self.h_strategy = self.h_strategy + g_strategy * (target_strategy - self.h_strategy) * (dt / self.tau_strategy)
+        
+        # --- 6. Latent Prediction (JEPA) ---
+        p_reflex = self.P_reflex(self.h_reflex)
+        p_concept = self.P_concept(self.h_concept)
+        p_strategy = self.P_strategy(self.h_strategy)
+        
+        # --- 7. Selective Decoding ---
+        full_h = torch.cat([self.h_reflex, self.h_concept, self.h_strategy], dim=1)
+        actions = self.decoder(full_h)
+        value = self.critic(full_h)
+        energy = torch.mean(torch.abs(full_h))
+        
+        return actions, value, energy, (flash_actions, confidence, p_reflex, p_concept, p_strategy)
+
+    def reset_state(self):
+        self.h_reflex = None
+        self.h_concept = None
+        self.h_strategy = None
+
+    def detach_state(self):
+        """Detaches the hidden state from the computation graph."""
+        if self.h_reflex is not None: self.h_reflex = self.h_reflex.detach()
+        if self.h_concept is not None: self.h_concept = self.h_concept.detach()
+        if self.h_strategy is not None: self.h_strategy = self.h_strategy.detach()
+
+    def resize_hidden(self, new_hidden_size):
+        if new_hidden_size == self.hidden_size:
+            return
+            
+        print(f"NeuromodulatedHolographicBrain: Resizing Hidden {self.hidden_size} -> {new_hidden_size}")
+        self.hidden_size = new_hidden_size
+        self.reflex_size = new_hidden_size // 4
+        self.strategy_size = new_hidden_size // 4
+        self.concept_size = new_hidden_size - (self.reflex_size + self.strategy_size)
+        
+        self.W_reflex.resize(out_features=self.reflex_size)
+        self.R_reflex.resize(in_features=self.reflex_size, out_features=self.reflex_size)
+        self.W_concept.resize(in_features=self.reflex_size, out_features=self.concept_size)
+        self.R_concept.resize(in_features=self.concept_size, out_features=self.concept_size)
+        self.W_strategy.resize(in_features=self.concept_size, out_features=self.strategy_size)
+        self.R_strategy.resize(in_features=self.strategy_size, out_features=self.strategy_size)
+        
+        self.P_reflex.resize(in_features=self.reflex_size, out_features=self.reflex_size)
+        self.P_concept.resize(in_features=self.concept_size, out_features=self.concept_size)
+        self.P_strategy.resize(in_features=self.strategy_size, out_features=self.strategy_size)
+        
+        self.tau_reflex = nn.Parameter(torch.rand(self.reflex_size) * 0.1 + 0.01)
+        self.tau_concept = nn.Parameter(torch.rand(self.concept_size) * 0.4 + 0.1)
+        self.tau_strategy = nn.Parameter(torch.rand(self.strategy_size) * 9.0 + 1.0)
+        
+        self.router_reflex = nn.Linear(self.encoded_size, 64)
+        self.router_concept = nn.Linear(self.reflex_size, 64)
+        self.router_strategy = nn.Linear(self.concept_size, 64)
+        
+        self.flash_head = nn.Linear(self.reflex_size, self.output_size)
+        self.flash_confidence = nn.Linear(self.reflex_size, 1)
+        self.decoder = nn.Linear(new_hidden_size, self.output_size)
+        self.intent_gate = nn.Linear(new_hidden_size, 1)
+        self.critic = nn.Linear(new_hidden_size, 1)
+        
+        self.reset_state()
+
+    def resize_input(self, new_input_size):
+        if new_input_size == self.input_size:
+            return
+        print(f"NeuromodulatedHolographicBrain: Resizing Input {self.input_size} -> {new_input_size}")
+        self.input_size = new_input_size
+        self.input_projection = nn.Linear(new_input_size, self.base_res**3)
+        self.reset_state()
