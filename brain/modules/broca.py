@@ -82,6 +82,9 @@ class BrocaModule(nn.Module):
         # 7. Sequential Mode
         self.sequential_mode = False
         
+        # 8. Context Tracking
+        self.register_buffer('last_context', torch.zeros(embedding_dim))
+        
     def reset_state(self):
         """Resets the state of all experts and memory."""
         for expert in self.experts:
@@ -199,6 +202,9 @@ class BrocaModule(nn.Module):
         # Titans Memory Update (Surprise!)
         # We observe the final semantic state.
         self.titans.observe(final_output.detach())
+        
+        # Update Context
+        self.last_context = final_output.detach()
             
         return final_output.detach()
 
@@ -238,10 +244,6 @@ class BrocaModule(nn.Module):
         
         # 2. Process Sequence
         return self._process_signal_sequence(signals, reward=reward)
-
-    def get_concept_vector(self, word):
-        # Placeholder for future word-level embedding
-        return self.process_text(word)
 
     def _process_batched_signals(self, input_signal):
         """

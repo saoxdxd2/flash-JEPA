@@ -129,7 +129,7 @@ class ModularBrain(nn.Module):
 
     def resize_hidden(self, new_hidden_size):
         self.visual_hidden = int(new_hidden_size * 0.4)
-        self.motor_hidden = int(new_hidden_size * 0.6)
+        self.motor_hidden = new_hidden_size - self.visual_hidden # Avoid rounding loss
         
         if hasattr(self.visual_cortex, 'resize_hidden'):
             self.visual_cortex.resize_hidden(self.visual_hidden)

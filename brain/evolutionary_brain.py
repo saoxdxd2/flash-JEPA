@@ -215,7 +215,17 @@ class EvolutionaryBrain:
              print(f"  value: {value.shape}, rewards: {rewards.shape}")
              print(f"  p_reflex: {p_reflex.shape}, t_reflex: {t_reflex.shape}")
              
-        total_loss.backward()
+        try:
+            total_loss.backward()
+        except RuntimeError as e:
+            print(f"DEBUG: Backward Pass Failed!")
+            print(f"DEBUG: Error: {e}")
+            print(f"DEBUG: Parameter Shapes:")
+            for name, param in self.trm.named_parameters():
+                if param.requires_grad:
+                    print(f"  {name}: {param.shape}")
+            raise e
+            
         self.trm_optimizer.step()
         
         self.last_surprise = jepa_loss.item()
@@ -227,7 +237,9 @@ class EvolutionaryBrain:
                 self.chemistry.dopamine, 
                 self.chemistry.serotonin, 
                 self.chemistry.norepinephrine, 
-                self.stamina
+                self.stamina,
+                0.0, # Default surprise
+                0.0  # Default text density
             ], device=foveal_latent.device)
         elif not isinstance(bio_state, torch.Tensor):
             bio_state = torch.tensor(bio_state, dtype=torch.float32, device=foveal_latent.device)
@@ -238,30 +250,70 @@ class EvolutionaryBrain:
         elif self.prev_action is not None:
             last_action_vec[self.prev_action % 100] = 1.0
             
+        # Calculate padding based on actual bio_state size
+        bio_size = bio_state.shape[0]
+        padding_size = self.genome.NON_VISUAL_INPUT_SIZE - (bio_size + 100)
+        
         full_input = torch.cat([
             foveal_latent.flatten(),
             peripheral_latent.flatten(),
             semantic_latent.flatten(),
             bio_state,
             last_action_vec,
-            torch.zeros(self.genome.NON_VISUAL_INPUT_SIZE - 104, device=foveal_latent.device)
+            torch.zeros(max(0, padding_size), device=foveal_latent.device)
         ]).unsqueeze(0)
         
         return full_input
 
     def wake_cycle(self, reward=0.0):
-        img = self.retina.get_fovea()
-        foveal_latent, _ = self.retina.encode(img)
-        peripheral_latent = torch.zeros_like(foveal_latent)
+        # 1. Get Latest Vision Data from Retina
+        vision_data = self.retina.get_latest_input()
+        if vision_data is None:
+            return "WAITING_FOR_RETINA"
+            
+        foveal_latent, peripheral_latent, surprise, text_density, fovea_tensor = vision_data
+        
+        # Convert latents to tensors if they are numpy
+        device = next(self.trm.parameters()).device
+        if isinstance(foveal_latent, np.ndarray):
+            foveal_latent = torch.from_numpy(foveal_latent).float().to(device)
+        if isinstance(peripheral_latent, np.ndarray):
+            peripheral_latent = torch.from_numpy(peripheral_latent).float().to(device)
+            
+        # 2. Get Semantic Context from Broca
         semantic_latent = self.broca.get_current_context()
-        full_input = self.get_input_vector(foveal_latent, peripheral_latent, semantic_latent)
+        
+        # 3. Construct Full Input Vector
+        # Bio state includes surprise and text density as "internal senses"
+        bio_state = torch.tensor([
+            self.chemistry.dopamine, 
+            self.chemistry.serotonin, 
+            self.chemistry.norepinephrine, 
+            self.stamina,
+            surprise,
+            text_density
+        ], device=device)
+        
+        full_input = self.get_input_vector(foveal_latent, peripheral_latent, semantic_latent, bio_state=bio_state)
+        
+        # 4. Decide Action
         action, _ = self.decide(full_input)
+        
+        # 5. Execute Action
         self.cradle.execute_code(action)
+        
+        # 6. Update Replay Buffer (Experience Replay)
         if self.prev_state is not None:
             self.replay_buffer.add(self.prev_state, self.prev_action, reward, full_input, False)
+            
+        # 7. Update State for next cycle
         self.prev_state = full_input
         self.prev_action = action
         self.prev_reward = reward
+        
+        # Update chemistry based on effort
+        self.chemistry.update(reward, action_cost=0.01) # Basic cost
+        
         return action
 
     def dream(self, steps=10):
@@ -335,6 +387,9 @@ class EvolutionaryBrain:
         target_hidden = checkpoint.get('hidden_size', self.hidden_size)
         target_latent = checkpoint.get('latent_dim', self.latent_dim)
             
+        # Load states
+        trm_state = checkpoint['trm_state']
+        
         # Resize if needed
         if target_latent != self.latent_dim or target_hidden != self.hidden_size:
             print(f"Brain: Schema mismatch detected (Latent: {self.latent_dim}->{target_latent}, Hidden: {self.hidden_size}->{target_hidden})")
@@ -345,19 +400,43 @@ class EvolutionaryBrain:
                 self.resize_latent(target_latent)
             if target_hidden != self.hidden_size:
                 self.resize_hidden(target_hidden)
+                
+            # Aggressively strip size-sensitive parameters on schema mismatch
+            # These will be re-initialized with correct shapes during resize_hidden or kept at random if missing
+            keys_to_remove = [k for k in trm_state.keys() if any(x in k for x in ['tau_', 'router_', 'flash_', 'decoder', 'critic', 'intent_gate'])]
+            for k in keys_to_remove:
+                if k in trm_state: del trm_state[k]
         
-        # Load states
-        trm_state = checkpoint['trm_state']
-        # Strip stale activity buffers and CSR indices that might cause shape mismatch
+        # Smart Healing: Strip any parameters that don't match the current model's shapes
+        # This prevents "Frankenstein" models with mismatched hierarchical layers
+        current_model_dict = self.trm.state_dict()
+        mismatched_keys = []
+        for k, v in trm_state.items():
+            if k in current_model_dict:
+                if v.shape != current_model_dict[k].shape:
+                    mismatched_keys.append(k)
+            else:
+                mismatched_keys.append(k) # Orphaned key
+                
+        if mismatched_keys:
+            print(f"Brain: Stripping {len(mismatched_keys)} mismatched parameters from state dict to ensure shape stability.")
+            for k in mismatched_keys:
+                del trm_state[k]
+        
+        # Always strip stale activity buffers and CSR indices
         keys_to_remove = [k for k in trm_state.keys() if any(x in k for x in ['activity_in', 'activity_out', 'crow_indices', 'col_indices'])]
         for k in keys_to_remove:
-            del trm_state[k]
+            if k in trm_state: del trm_state[k]
             
         self.trm.load_state_dict(trm_state, strict=False)
         self.retina.load_state_dict(checkpoint['retina_state'], strict=False)
         if 'broca_state' in checkpoint:
             self.broca.load(checkpoint['broca_state'])
             
+        # Re-init optimizer after loading to ensure it tracks the current parameters
+        # and starts with fresh momentum/state for the new model
+        self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate)
+        
         print(f"Brain: Successfully loaded v{version} checkpoint.")
 
     def resize_latent(self, new_latent_size):

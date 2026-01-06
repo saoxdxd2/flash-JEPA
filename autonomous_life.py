@@ -34,14 +34,27 @@ def main():
             brain = EvolutionaryBrain(genome)
             
             # 4. Load Learned Weights (N2N2)
+            transplanted_path = "models/saved/gen_350_transplanted.pt"
             model_path = individual.get('model_path')
-            if model_path and os.path.exists(model_path):
+            
+            if os.path.exists(transplanted_path):
+                print(f"Loading TRANSPLANTED model from: {transplanted_path}")
+                brain.load_model(transplanted_path)
+                # Update both local and individual path
+                model_path = transplanted_path
+                individual['model_path'] = transplanted_path
+            elif model_path and os.path.exists(model_path):
                 print(f"Loading model from: {model_path}")
                 brain.load_model(model_path)
             else:
                 # Inject Base Knowledge if new
+                print("No existing model found. Injecting Base Knowledge...")
                 n2n = KnowledgeLoader(brain)
                 n2n.inject_knowledge()
+                # Ensure we have a path for future saves
+                os.makedirs("models/saved", exist_ok=True)
+                model_path = f"models/saved/gen_{generation}_elite.pt"
+                individual['model_path'] = model_path
             
             brain.start()
             

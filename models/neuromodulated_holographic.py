@@ -262,35 +262,42 @@ class NeuromodulatedHolographicBrain(nn.Module):
         # --- 3. Hierarchical Update ---
         
         # Level 1: Reflex
-        r_reflex = torch.sigmoid(self.router_reflex(encoded_input))
-        reflex_mask = (r_reflex > 0.5).float().repeat(1, (r_size + 63) // 64)[:, :r_size]
-        
-        sensory_reflex = self.W_reflex(encoded_input) * reflex_mask
-        rec_reflex = self.R_reflex(self.h_reflex)
-        target_reflex = torch.tanh(sensory_reflex + rec_reflex)
-        self.h_reflex = self.h_reflex + g_reflex * (target_reflex - self.h_reflex) * (dt / self.tau_reflex)
-        
-        # Flash Head
-        flash_actions = self.flash_head(self.h_reflex)
-        confidence = torch.sigmoid(self.flash_confidence(self.h_reflex))
-        
-        # Level 2: Concept
-        r_concept = torch.sigmoid(self.router_concept(self.h_reflex))
-        concept_mask = (r_concept > 0.5).float().repeat(1, (c_size + 63) // 64)[:, :c_size]
-        
-        sensory_concept = self.W_concept(self.h_reflex) * concept_mask
-        rec_concept = self.R_concept(self.h_concept)
-        target_concept = torch.tanh(sensory_concept + rec_concept)
-        self.h_concept = self.h_concept + g_concept * (target_concept - self.h_concept) * (dt / self.tau_concept)
-        
-        # Level 3: Strategy
-        r_strategy = torch.sigmoid(self.router_strategy(self.h_concept))
-        strategy_mask = (r_strategy > 0.5).float().repeat(1, (s_size + 63) // 64)[:, :s_size]
-        
-        sensory_strategy = self.W_strategy(self.h_concept) * strategy_mask
-        rec_strategy = self.R_strategy(self.h_strategy)
-        target_strategy = torch.tanh(sensory_strategy + rec_strategy)
-        self.h_strategy = self.h_strategy + g_strategy * (target_strategy - self.h_strategy) * (dt / self.tau_strategy)
+        try:
+            r_reflex = torch.sigmoid(self.router_reflex(encoded_input))
+            reflex_mask = (r_reflex > 0.5).float().repeat(1, (r_size + 63) // 64)[:, :r_size]
+            
+            sensory_reflex = self.W_reflex(encoded_input) * reflex_mask
+            rec_reflex = self.R_reflex(self.h_reflex)
+            target_reflex = torch.tanh(sensory_reflex + rec_reflex)
+            self.h_reflex = self.h_reflex + g_reflex * (target_reflex - self.h_reflex) * (dt / self.tau_reflex)
+            
+            # Flash Head
+            flash_actions = self.flash_head(self.h_reflex)
+            confidence = torch.sigmoid(self.flash_confidence(self.h_reflex))
+            
+            # Level 2: Concept
+            r_concept = torch.sigmoid(self.router_concept(self.h_reflex))
+            concept_mask = (r_concept > 0.5).float().repeat(1, (c_size + 63) // 64)[:, :c_size]
+            
+            sensory_concept = self.W_concept(self.h_reflex) * concept_mask
+            rec_concept = self.R_concept(self.h_concept)
+            target_concept = torch.tanh(sensory_concept + rec_concept)
+            self.h_concept = self.h_concept + g_concept * (target_concept - self.h_concept) * (dt / self.tau_concept)
+            
+            # Level 3: Strategy
+            r_strategy = torch.sigmoid(self.router_strategy(self.h_concept))
+            strategy_mask = (r_strategy > 0.5).float().repeat(1, (s_size + 63) // 64)[:, :s_size]
+            
+            sensory_strategy = self.W_strategy(self.h_concept) * strategy_mask
+            rec_strategy = self.R_strategy(self.h_strategy)
+            target_strategy = torch.tanh(sensory_strategy + rec_strategy)
+            self.h_strategy = self.h_strategy + g_strategy * (target_strategy - self.h_strategy) * (dt / self.tau_strategy)
+        except RuntimeError as e:
+            print(f"DEBUG: Shape Mismatch in Hierarchical Update!")
+            print(f"DEBUG: r_size: {r_size}, c_size: {c_size}, s_size: {s_size}")
+            print(f"DEBUG: h_reflex: {self.h_reflex.shape}, h_concept: {self.h_concept.shape}, h_strategy: {self.h_strategy.shape}")
+            print(f"DEBUG: tau_reflex: {self.tau_reflex.shape}, tau_concept: {self.tau_concept.shape}, tau_strategy: {self.tau_strategy.shape}")
+            raise e
         
         # --- 6. Latent Prediction (JEPA) ---
         p_reflex = self.P_reflex(self.h_reflex)
@@ -323,6 +330,8 @@ class NeuromodulatedHolographicBrain(nn.Module):
         s_size = new_hidden_size // 4
         c_size = new_hidden_size - (r_size + s_size)
         
+        device = next(self.parameters()).device
+        
         self.W_reflex.resize(out_features=r_size)
         self.R_reflex.resize(in_features=r_size, out_features=r_size)
         self.W_concept.resize(in_features=r_size, out_features=c_size)
@@ -334,19 +343,19 @@ class NeuromodulatedHolographicBrain(nn.Module):
         self.P_concept.resize(in_features=c_size, out_features=c_size)
         self.P_strategy.resize(in_features=s_size, out_features=s_size)
         
-        self.tau_reflex = nn.Parameter(torch.rand(r_size) * 0.1 + 0.01)
-        self.tau_concept = nn.Parameter(torch.rand(c_size) * 0.4 + 0.1)
-        self.tau_strategy = nn.Parameter(torch.rand(s_size) * 9.0 + 1.0)
+        self.tau_reflex = nn.Parameter(torch.rand(r_size, device=device) * 0.1 + 0.01)
+        self.tau_concept = nn.Parameter(torch.rand(c_size, device=device) * 0.4 + 0.1)
+        self.tau_strategy = nn.Parameter(torch.rand(s_size, device=device) * 9.0 + 1.0)
         
-        self.router_reflex = nn.Linear(self.encoded_size, 64)
-        self.router_concept = nn.Linear(r_size, 64)
-        self.router_strategy = nn.Linear(c_size, 64)
+        self.router_reflex = nn.Linear(self.encoded_size, 64).to(device)
+        self.router_concept = nn.Linear(r_size, 64).to(device)
+        self.router_strategy = nn.Linear(c_size, 64).to(device)
         
-        self.flash_head = nn.Linear(r_size, self.output_size)
-        self.flash_confidence = nn.Linear(r_size, 1)
-        self.decoder = nn.Linear(new_hidden_size, self.output_size)
-        self.intent_gate = nn.Linear(new_hidden_size, 1)
-        self.critic = nn.Linear(new_hidden_size, 1)
+        self.flash_head = nn.Linear(r_size, self.output_size).to(device)
+        self.flash_confidence = nn.Linear(r_size, 1).to(device)
+        self.decoder = nn.Linear(new_hidden_size, self.output_size).to(device)
+        self.intent_gate = nn.Linear(new_hidden_size, 1).to(device)
+        self.critic = nn.Linear(new_hidden_size, 1).to(device)
         
         self.reset_state()
 
@@ -356,3 +365,49 @@ class NeuromodulatedHolographicBrain(nn.Module):
         self.input_size = new_input_size
         self.input_projection = nn.Linear(new_input_size, self.base_res**3)
         self.reset_state()
+
+    def learn_trajectory(self, input_sequence, target_h_sequence, lr=0.001):
+        """
+        Supervised State Imprinting (SSI) for NeuromodulatedHolographicBrain.
+        Trains the hierarchical states to match a teacher trajectory.
+        
+        input_sequence: [T, Batch, input_size]
+        target_h_sequence: [T, Batch, hidden_size]
+        """
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        total_loss = 0.0
+        
+        # Derive sizes
+        r_size = self.W_reflex.out_features
+        s_size = self.W_strategy.out_features
+        c_size = self.W_concept.out_features
+        
+        self.reset_state()
+        for t in range(len(input_sequence)):
+            optimizer.zero_grad()
+            
+            # Forward pass (single step)
+            actions, value, energy, (flash, conf, p_r, p_c, p_s) = self.forward(input_sequence[t])
+            
+            # Combine current states
+            current_h = torch.cat([self.h_reflex, self.h_concept, self.h_strategy], dim=1)
+            
+            # Target for this step
+            target_h = target_h_sequence[t]
+            
+            # Loss: Match the full hidden state
+            loss = F.mse_loss(current_h, target_h)
+            
+            # Also match JEPA predictions if possible (Self-Consistency)
+            if t < len(target_h_sequence) - 1:
+                next_target = target_h_sequence[t+1]
+                t_r, t_c, t_s = torch.split(next_target, [r_size, c_size, s_size], dim=1)
+                loss += 0.1 * (F.mse_loss(p_r, t_r) + F.mse_loss(p_c, t_c) + F.mse_loss(p_s, t_s))
+            
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            self.detach_state() # Keep it recurrent but bounded
+            
+        return total_loss / len(input_sequence)
