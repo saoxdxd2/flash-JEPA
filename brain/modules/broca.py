@@ -554,3 +554,9 @@ class BrocaModule(nn.Module):
         
         self.embedding_dim = new_latent_size
 
+    def get_current_context(self):
+        """
+        Returns the latest semantic context (last_context buffer).
+        """
+        return self.last_context
+
