@@ -145,17 +145,6 @@ class SparseLinear(nn.Module):
 class NeuromodulatedHolographicBrain(nn.Module):
     """
     Hybrid H-NH-JEPA Architecture.
-    
-    Hierarchy:
-    1. Reflex Layer (Fast, Sensory)
-    2. Concept Layer (Medium, Working Memory)
-    3. Strategy Layer (Slow, Goals/Context)
-    
-    Dynamics:
-    - Holographic Wavelet Encoder: Spatial resolution scaling.
-    - Decoder-Free JEPA: Predicts next latent state.
-    - Neuromodulated Gating: Chemicals control hierarchical flow.
-    - Sparse CSR Core: 1M+ neuron resolution on CPU.
     """
     def __init__(self, input_size, hidden_size, output_size, genome=None, **kwargs):
         super().__init__()
@@ -175,61 +164,49 @@ class NeuromodulatedHolographicBrain(nn.Module):
         self.input_projection = nn.Linear(input_size, self.base_res**3)
         
         # --- 2. Hierarchical Dimensions ---
-        # Ensure they sum exactly to hidden_size to avoid mat1/mat2 mismatch
-        self.reflex_size = hidden_size // 4
-        self.strategy_size = hidden_size // 4
-        self.concept_size = hidden_size - (self.reflex_size + self.strategy_size)
+        r_size = hidden_size // 4
+        s_size = hidden_size // 4
+        c_size = hidden_size - (r_size + s_size)
         
         # --- 3. Sparse Hierarchical Core ---
-        # Level 1: Reflex (Encoded -> Reflex, Reflex -> Reflex)
-        self.W_reflex = SparseLinear(self.encoded_size, self.reflex_size)
-        self.R_reflex = SparseLinear(self.reflex_size, self.reflex_size)
+        self.W_reflex = SparseLinear(self.encoded_size, r_size)
+        self.R_reflex = SparseLinear(r_size, r_size)
         
-        # Level 2: Concept (Reflex -> Concept, Concept -> Concept)
-        self.W_concept = SparseLinear(self.reflex_size, self.concept_size)
-        self.R_concept = SparseLinear(self.concept_size, self.concept_size)
+        self.W_concept = SparseLinear(r_size, c_size)
+        self.R_concept = SparseLinear(c_size, c_size)
         
-        # Level 3: Strategy (Concept -> Strategy, Strategy -> Strategy)
-        self.W_strategy = SparseLinear(self.concept_size, self.strategy_size)
-        self.R_strategy = SparseLinear(self.strategy_size, self.strategy_size)
+        self.W_strategy = SparseLinear(c_size, s_size)
+        self.R_strategy = SparseLinear(s_size, s_size)
         
         # --- 4. Latent Predictors (JEPA) ---
-        self.P_reflex = SparseLinear(self.reflex_size, self.reflex_size)
-        self.P_concept = SparseLinear(self.concept_size, self.concept_size)
-        self.P_strategy = SparseLinear(self.strategy_size, self.strategy_size)
+        self.P_reflex = SparseLinear(r_size, r_size)
+        self.P_concept = SparseLinear(c_size, c_size)
+        self.P_strategy = SparseLinear(s_size, s_size)
         
         # --- 5. Neuromodulated Gating ---
-        # Chemicals (Dopamine, Serotonin, Norepinephrine, Cortisol)
-        # Input: Encoded (256) + Chemicals (4) = 260
         self.meta_controller = nn.Sequential(
             nn.Linear(self.encoded_size + 4, 64),
             nn.Tanh(),
-            nn.Linear(64, 3) # [Reflex_Gate, Concept_Gate, Strategy_Gate]
+            nn.Linear(64, 3) 
         )
         
         # --- 6. Sparse MoE Routers ---
-        # Each level has a router that selects active "experts" (neurons)
         self.router_reflex = nn.Linear(self.encoded_size, 64)
-        self.router_concept = nn.Linear(self.reflex_size, 64)
-        self.router_strategy = nn.Linear(self.concept_size, 64)
+        self.router_concept = nn.Linear(r_size, 64)
+        self.router_strategy = nn.Linear(c_size, 64)
         
-        self.top_k = 4 # Number of "Expert Blocks" to activate
-        
-        # --- 6. Temporal Dynamics (Per-neuron Tau) ---
-        self.tau_reflex = nn.Parameter(torch.rand(self.reflex_size) * 0.1 + 0.01) # 1-10ms
-        self.tau_concept = nn.Parameter(torch.rand(self.concept_size) * 0.4 + 0.1) # 100-500ms
-        self.tau_strategy = nn.Parameter(torch.rand(self.strategy_size) * 9.0 + 1.0) # 1-10s
+        # --- 6. Temporal Dynamics ---
+        self.tau_reflex = nn.Parameter(torch.rand(r_size) * 0.1 + 0.01)
+        self.tau_concept = nn.Parameter(torch.rand(c_size) * 0.4 + 0.1)
+        self.tau_strategy = nn.Parameter(torch.rand(s_size) * 9.0 + 1.0)
         
         # --- 7. Flash Head (System 1) ---
-        # Fast action proposals from Level 1 (Reflex)
-        self.flash_head = nn.Linear(self.reflex_size, output_size)
-        self.flash_confidence = nn.Linear(self.reflex_size, 1) # Entropy/Confidence threshold
+        self.flash_head = nn.Linear(r_size, output_size)
+        self.flash_confidence = nn.Linear(r_size, 1)
         
         # --- 8. Selective Decoder (System 2) ---
         self.decoder = nn.Linear(hidden_size, output_size)
-        self.intent_gate = nn.Linear(hidden_size, 1) # Decides when to act
-        
-        # --- 9. RL Critic ---
+        self.intent_gate = nn.Linear(hidden_size, 1)
         self.critic = nn.Linear(hidden_size, 1)
         
         # State
@@ -237,27 +214,16 @@ class NeuromodulatedHolographicBrain(nn.Module):
         self.h_concept = None
         self.h_strategy = None
         
-        # --- 10. Routing-Aware Initialization ---
         self._init_routing_specialization()
         
     def _init_routing_specialization(self):
-        """
-        Initializes sparse weights such that different expert blocks 
-        have different 'preferences' in the input space.
-        """
-        print("NeuromodulatedHolographicBrain: Initializing Routing-Aware Specialization...")
         with torch.no_grad():
-            # For each level, we want to ensure the router can distinguish between blocks
             for name, module in self.named_modules():
                 if isinstance(module, SparseLinear):
-                    # Add a small block-specific bias to the sparse values
-                    # This helps the router find 'specialists' early on
                     num_blocks = module.out_features // 64
                     if num_blocks > 0:
                         for b in range(num_blocks):
-                            # Find indices belonging to this block
                             mask = (module.indices[1] >= b*64) & (module.indices[1] < (b+1)*64)
-                            # Add block-specific noise to values
                             module.values.data[mask] += torch.randn(mask.sum()) * 0.01 * (b / num_blocks)
         
     def forward(self, input_vector, dt=0.1, reward=0.0, chemicals=None, train_internal_rl=True):
@@ -265,24 +231,25 @@ class NeuromodulatedHolographicBrain(nn.Module):
             input_vector = input_vector.unsqueeze(0)
         batch_size = input_vector.shape[0]
         
+        # Derive sizes directly from parameters (Static Shape Philosophy)
+        r_size = self.W_reflex.out_features
+        c_size = self.W_concept.out_features
+        s_size = self.W_strategy.out_features
+        
         # Init States
-        if self.h_reflex is None or self.h_reflex.shape[0] != batch_size or self.h_reflex.shape[1] != self.reflex_size:
-            self.h_reflex = torch.zeros(batch_size, self.reflex_size, device=input_vector.device)
-        if self.h_concept is None or self.h_concept.shape[0] != batch_size or self.h_concept.shape[1] != self.concept_size:
-            self.h_concept = torch.zeros(batch_size, self.concept_size, device=input_vector.device)
-        if self.h_strategy is None or self.h_strategy.shape[0] != batch_size or self.h_strategy.shape[1] != self.strategy_size:
-            self.h_strategy = torch.zeros(batch_size, self.strategy_size, device=input_vector.device)
+        if self.h_reflex is None or self.h_reflex.shape[0] != batch_size or self.h_reflex.shape[1] != r_size:
+            self.h_reflex = torch.zeros(batch_size, r_size, device=input_vector.device)
+        if self.h_concept is None or self.h_concept.shape[0] != batch_size or self.h_concept.shape[1] != c_size:
+            self.h_concept = torch.zeros(batch_size, c_size, device=input_vector.device)
+        if self.h_strategy is None or self.h_strategy.shape[0] != batch_size or self.h_strategy.shape[1] != s_size:
+            self.h_strategy = torch.zeros(batch_size, s_size, device=input_vector.device)
             
         # --- 1. Holographic Encoding ---
         x = self.input_projection(input_vector).view(batch_size, 1, self.base_res, self.base_res, self.base_res)
-        
-        features = []
         curr = x
         for layer in self.encoder_levels:
             curr = F.relu(layer(curr))
-            features.append(curr.flatten(1))
-            
-        encoded_input = features[-1] 
+        encoded_input = curr.flatten(1)
         
         # --- 2. Neuromodulated Gating ---
         if chemicals is None:
@@ -292,62 +259,35 @@ class NeuromodulatedHolographicBrain(nn.Module):
         gates = torch.sigmoid(self.meta_controller(meta_input))
         g_reflex, g_concept, g_strategy = torch.chunk(gates, 3, dim=1)
         
-        # --- 3. Hierarchical Update (Bottom-Up) ---
+        # --- 3. Hierarchical Update ---
         
-        # Level 1: Reflex (System 1 - Flash)
-        # MoE Routing: Select active neurons
+        # Level 1: Reflex
         r_reflex = torch.sigmoid(self.router_reflex(encoded_input))
-        reflex_mask = (r_reflex > 0.5).float() # Sparse mask
+        reflex_mask = (r_reflex > 0.5).float().repeat(1, (r_size + 63) // 64)[:, :r_size]
         
-        # Correctly repeat and slice mask to match reflex_size
-        full_reflex_mask = reflex_mask.repeat(1, (self.reflex_size + 63) // 64)[:, :self.reflex_size]
-        
-        sensory_reflex = self.W_reflex(encoded_input) * full_reflex_mask
+        sensory_reflex = self.W_reflex(encoded_input) * reflex_mask
         rec_reflex = self.R_reflex(self.h_reflex)
         target_reflex = torch.tanh(sensory_reflex + rec_reflex)
-        
-        # DEBUG: Check shapes
-        if self.h_reflex.shape[1] != self.reflex_size:
-            print(f"DEBUG: {self.__class__.__name__} h_reflex shape mismatch! {self.h_reflex.shape} vs {self.reflex_size}")
-            
-        self.h_reflex = self.h_reflex + g_reflex * (target_reflex - self.h_reflex) * (dt / self.tau_reflex)
-        reflex_mask = (r_reflex > 0.5).float() # Sparse mask
-        
-        # Correctly repeat and slice mask to match reflex_size
-        full_reflex_mask = reflex_mask.repeat(1, (self.reflex_size + 63) // 64)[:, :self.reflex_size]
-        
-        sensory_reflex = self.W_reflex(encoded_input) * full_reflex_mask
-        rec_reflex = self.R_reflex(self.h_reflex)
-        target_reflex = torch.tanh(sensory_reflex + rec_reflex)
-        
-        # DEBUG: Check shapes
-        if self.h_reflex.shape[1] != self.reflex_size:
-            print(f"DEBUG: {self.__class__.__name__} h_reflex shape mismatch! {self.h_reflex.shape} vs {self.reflex_size}")
-            
         self.h_reflex = self.h_reflex + g_reflex * (target_reflex - self.h_reflex) * (dt / self.tau_reflex)
         
-        # --- 4. Flash Logic (Early Exit / System 1) ---
-        # If Level 1 is confident, we can propose an action immediately
+        # Flash Head
         flash_actions = self.flash_head(self.h_reflex)
         confidence = torch.sigmoid(self.flash_confidence(self.h_reflex))
         
-        # --- 5. System 2 (Deep Reasoning) ---
         # Level 2: Concept
         r_concept = torch.sigmoid(self.router_concept(self.h_reflex))
-        concept_mask = (r_concept > 0.5).float()
-        full_concept_mask = concept_mask.repeat(1, (self.concept_size + 63) // 64)[:, :self.concept_size]
+        concept_mask = (r_concept > 0.5).float().repeat(1, (c_size + 63) // 64)[:, :c_size]
         
-        sensory_concept = self.W_concept(self.h_reflex) * full_concept_mask
+        sensory_concept = self.W_concept(self.h_reflex) * concept_mask
         rec_concept = self.R_concept(self.h_concept)
         target_concept = torch.tanh(sensory_concept + rec_concept)
         self.h_concept = self.h_concept + g_concept * (target_concept - self.h_concept) * (dt / self.tau_concept)
         
         # Level 3: Strategy
         r_strategy = torch.sigmoid(self.router_strategy(self.h_concept))
-        strategy_mask = (r_strategy > 0.5).float()
-        full_strategy_mask = strategy_mask.repeat(1, (self.strategy_size + 63) // 64)[:, :self.strategy_size]
+        strategy_mask = (r_strategy > 0.5).float().repeat(1, (s_size + 63) // 64)[:, :s_size]
         
-        sensory_strategy = self.W_strategy(self.h_concept) * full_strategy_mask
+        sensory_strategy = self.W_strategy(self.h_concept) * strategy_mask
         rec_strategy = self.R_strategy(self.h_strategy)
         target_strategy = torch.tanh(sensory_strategy + rec_strategy)
         self.h_strategy = self.h_strategy + g_strategy * (target_strategy - self.h_strategy) * (dt / self.tau_strategy)
@@ -371,42 +311,39 @@ class NeuromodulatedHolographicBrain(nn.Module):
         self.h_strategy = None
 
     def detach_state(self):
-        """Detaches the hidden state from the computation graph."""
         if self.h_reflex is not None: self.h_reflex = self.h_reflex.detach()
         if self.h_concept is not None: self.h_concept = self.h_concept.detach()
         if self.h_strategy is not None: self.h_strategy = self.h_strategy.detach()
 
     def resize_hidden(self, new_hidden_size):
-        if new_hidden_size == self.hidden_size:
-            return
-            
+        if new_hidden_size == self.hidden_size: return
         print(f"NeuromodulatedHolographicBrain: Resizing Hidden {self.hidden_size} -> {new_hidden_size}")
         self.hidden_size = new_hidden_size
-        self.reflex_size = new_hidden_size // 4
-        self.strategy_size = new_hidden_size // 4
-        self.concept_size = new_hidden_size - (self.reflex_size + self.strategy_size)
+        r_size = new_hidden_size // 4
+        s_size = new_hidden_size // 4
+        c_size = new_hidden_size - (r_size + s_size)
         
-        self.W_reflex.resize(out_features=self.reflex_size)
-        self.R_reflex.resize(in_features=self.reflex_size, out_features=self.reflex_size)
-        self.W_concept.resize(in_features=self.reflex_size, out_features=self.concept_size)
-        self.R_concept.resize(in_features=self.concept_size, out_features=self.concept_size)
-        self.W_strategy.resize(in_features=self.concept_size, out_features=self.strategy_size)
-        self.R_strategy.resize(in_features=self.strategy_size, out_features=self.strategy_size)
+        self.W_reflex.resize(out_features=r_size)
+        self.R_reflex.resize(in_features=r_size, out_features=r_size)
+        self.W_concept.resize(in_features=r_size, out_features=c_size)
+        self.R_concept.resize(in_features=c_size, out_features=c_size)
+        self.W_strategy.resize(in_features=c_size, out_features=s_size)
+        self.R_strategy.resize(in_features=s_size, out_features=s_size)
         
-        self.P_reflex.resize(in_features=self.reflex_size, out_features=self.reflex_size)
-        self.P_concept.resize(in_features=self.concept_size, out_features=self.concept_size)
-        self.P_strategy.resize(in_features=self.strategy_size, out_features=self.strategy_size)
+        self.P_reflex.resize(in_features=r_size, out_features=r_size)
+        self.P_concept.resize(in_features=c_size, out_features=c_size)
+        self.P_strategy.resize(in_features=s_size, out_features=s_size)
         
-        self.tau_reflex = nn.Parameter(torch.rand(self.reflex_size) * 0.1 + 0.01)
-        self.tau_concept = nn.Parameter(torch.rand(self.concept_size) * 0.4 + 0.1)
-        self.tau_strategy = nn.Parameter(torch.rand(self.strategy_size) * 9.0 + 1.0)
+        self.tau_reflex = nn.Parameter(torch.rand(r_size) * 0.1 + 0.01)
+        self.tau_concept = nn.Parameter(torch.rand(c_size) * 0.4 + 0.1)
+        self.tau_strategy = nn.Parameter(torch.rand(s_size) * 9.0 + 1.0)
         
         self.router_reflex = nn.Linear(self.encoded_size, 64)
-        self.router_concept = nn.Linear(self.reflex_size, 64)
-        self.router_strategy = nn.Linear(self.concept_size, 64)
+        self.router_concept = nn.Linear(r_size, 64)
+        self.router_strategy = nn.Linear(c_size, 64)
         
-        self.flash_head = nn.Linear(self.reflex_size, self.output_size)
-        self.flash_confidence = nn.Linear(self.reflex_size, 1)
+        self.flash_head = nn.Linear(r_size, self.output_size)
+        self.flash_confidence = nn.Linear(r_size, 1)
         self.decoder = nn.Linear(new_hidden_size, self.output_size)
         self.intent_gate = nn.Linear(new_hidden_size, 1)
         self.critic = nn.Linear(new_hidden_size, 1)
@@ -414,8 +351,7 @@ class NeuromodulatedHolographicBrain(nn.Module):
         self.reset_state()
 
     def resize_input(self, new_input_size):
-        if new_input_size == self.input_size:
-            return
+        if new_input_size == self.input_size: return
         print(f"NeuromodulatedHolographicBrain: Resizing Input {self.input_size} -> {new_input_size}")
         self.input_size = new_input_size
         self.input_projection = nn.Linear(new_input_size, self.base_res**3)

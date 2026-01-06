@@ -67,24 +67,13 @@ class ModularBrain(nn.Module):
     def forward(self, input_vector, dt=0.1, reward=0.0, chemicals=None, train_internal_rl=True):
         # 1. Visual Cortex
         # Returns: bus, value, energy, flash_info
-        # Visual Cortex Update
-        print(f"DEBUG: ModularBrain input_vector shape: {input_vector.shape}")
         res_v = self.visual_cortex(input_vector, dt=dt, reward=reward, chemicals=chemicals, train_internal_rl=train_internal_rl)
         bus, _, v_energy, v_flash = res_v if len(res_v) == 4 else (*res_v, None)
         
-        # DEBUG: Check bus shape
-        print(f"DEBUG: ModularBrain bus shape (output of visual cortex): {bus.shape}")
-        if bus.shape[-1] != self.bus_size: # Use -1 for last dimension, as batch dim might vary
-            print(f"DEBUG: ModularBrain bus output size mismatch! Expected {self.bus_size}, got {bus.shape[-1]}")
-            
         # 2. Motor Cortex
         # Returns: actions, value, energy, flash_info
-        # Motor Cortex Update
         res_m = self.motor_cortex(bus, dt=dt, reward=reward, chemicals=chemicals, train_internal_rl=train_internal_rl)
         actions, params, m_energy, m_flash = res_m if len(res_m) == 4 else (*res_m, None)
-        
-        print(f"DEBUG: ModularBrain actions shape (output of motor cortex): {actions.shape}")
-        print(f"DEBUG: ModularBrain params shape (output of motor cortex): {params.shape}")
         
         total_energy = v_energy + m_energy
         # We return the motor cortex's flash info as the primary one for action selection
