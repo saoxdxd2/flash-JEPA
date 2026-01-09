@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import random
 from models.plasticity_mlp import PlasticityMLP
+from brain.modules.device import get_best_device
 
 class VectorizedLiquidGraph(nn.Module):
     """
@@ -20,6 +21,7 @@ class VectorizedLiquidGraph(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
+        self.device = get_best_device()
         
         # --- Parameters (Tensors) ---
         # Time constants: [hidden_size]
@@ -76,52 +78,60 @@ class VectorizedLiquidGraph(nn.Module):
             self.x = torch.zeros(batch_size, self.hidden_size, device=input_vector.device)
             self.y = torch.zeros(batch_size, self.hidden_size, device=input_vector.device)
             
+        # Call ONNX-friendly forward
+        outputs, params, energy, next_x, next_y = self.forward_onnx(input_vector, self.x, self.y, dt)
+        
+        # Update states
+        self.x = next_x
+        self.y = next_y
+        
+        return outputs, params, energy
+
+    def forward_onnx(self, input_vector, x, y, dt=1.0):
+        """
+        ONNX-friendly forward pass. Stateless.
+        """
+        batch_size = input_vector.shape[0]
+        
         # 1. Gather Inputs
-        # I_total = W_in * I + W_rec * y
         i_in = F.linear(input_vector, self.w_in)
-        i_rec = F.linear(self.y, self.w_rec)
+        i_rec = F.linear(y, self.w_rec)
         total_input = i_in + i_rec
         
         # 2. ODE Integration (Euler)
-        # dx = dt * (-x + I) / tau
-        dx = dt * (-self.x + total_input) / self.tau
-        self.x = self.x + dx
-        self.x = torch.clamp(self.x, -10.0, 10.0)
+        dx = dt * (-x + total_input) / self.tau
+        next_x = x + dx
+        next_x = torch.clamp(next_x, -10.0, 10.0)
         
         # 3. Activation
-        # We use a mask-based approach to handle different activations in one pass
-        new_y = torch.zeros_like(self.x)
+        next_y = torch.zeros_like(next_x)
         
         # Tanh (Type 0)
         mask_tanh = (self.act_types == 0)
-        if mask_tanh.any():
-            new_y[:, mask_tanh] = torch.tanh(self.x[:, mask_tanh] + self.bias[mask_tanh])
+        # For ONNX, we avoid mask.any() if possible or use where
+        next_y = torch.where(mask_tanh.unsqueeze(0), torch.tanh(next_x + self.bias), next_y)
             
         # Sigmoid (Type 1)
         mask_sig = (self.act_types == 1)
-        if mask_sig.any():
-            new_y[:, mask_sig] = torch.sigmoid(self.x[:, mask_sig] + self.bias[mask_sig])
+        next_y = torch.where(mask_sig.unsqueeze(0), torch.sigmoid(next_x + self.bias), next_y)
             
         # ReLU (Type 2)
         mask_relu = (self.act_types == 2)
-        if mask_relu.any():
-            new_y[:, mask_relu] = F.relu(self.x[:, mask_relu] + self.bias[mask_relu])
+        next_y = torch.where(mask_relu.unsqueeze(0), F.relu(next_x + self.bias), next_y)
             
-        self.y = new_y
-        
         # 4. Map to Outputs
-        outputs = self.y[:, self.output_indices]
+        outputs = next_y[:, self.output_indices]
         
         if self.param_indices:
-            params = self.y[:, self.param_indices]
+            params = next_y[:, self.param_indices]
             params = torch.sigmoid(params)
         else:
             params = torch.zeros(batch_size, 2, device=input_vector.device)
             
         # Energy cost
-        energy = torch.mean(torch.abs(self.y)) * 0.01
+        energy = torch.mean(torch.abs(next_y)) * 0.01
         
-        return outputs, params, energy
+        return outputs, params, energy, next_x, next_y
 
     def reset_state(self):
         """Resets the hidden state of the brain."""

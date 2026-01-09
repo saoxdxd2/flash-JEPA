@@ -222,7 +222,7 @@ class Qwen3Teacher:
             
         return torch.stack(input_seq).unsqueeze(1), torch.stack(visual_h_seq).unsqueeze(1), torch.stack(motor_h_seq).unsqueeze(1), torch.stack(bus_seq).unsqueeze(1)
 
-    def train_step(self, steps=100):
+    def train_step(self, steps=100, batch_size=64):
         """Runs a batch of N2N2 imprinting."""
         if not self.loaded:
             print("Teacher not loaded. Call setup() first.")
@@ -235,8 +235,9 @@ class Qwen3Teacher:
         keys = sorted(list(self.source_data.keys()))
         
         # Select a contiguous block of keys
+        total_to_sample = steps * batch_size
         start_idx = self.last_key_index
-        end_idx = (start_idx + steps) % len(keys)
+        end_idx = (start_idx + total_to_sample) % len(keys)
         
         if end_idx > start_idx:
             batch_keys = keys[start_idx:end_idx]
@@ -254,37 +255,42 @@ class Qwen3Teacher:
                 self.n2n2.projection_matrix = torch.randn(source_dim, target_dim) / np.sqrt(target_dim)
         
         broca = self.brain.broca
+        optimizer = torch.optim.Adam(broca.parameters(), lr=0.001)
+        
         total_loss = 0.0
+        total_surprise = 0.0
         count = 0
         
-        for key in batch_keys:
-            target_embedding = self.source_data[key]
+        # Process in sub-batches
+        for i in range(0, len(batch_keys), batch_size):
+            sub_batch_keys = batch_keys[i:i+batch_size]
+            sub_batch_vectors = []
             
-            # 1. Prepare Input Spike
-            vector = torch.tensor(target_embedding, dtype=torch.float32)
-            if vector.dim() > 1:
-                vector = vector.flatten()
+            for key in sub_batch_keys:
+                vector = torch.tensor(self.source_data[key], dtype=torch.float32)
+                if vector.dim() > 1:
+                    vector = vector.flatten()
+                sub_batch_vectors.append(vector)
                 
+            if not sub_batch_vectors: continue
+            
+            batch_tensor = torch.stack(sub_batch_vectors)
+            
             # Apply Projection
             if self.n2n2.projection_matrix is not None:
-                vector = torch.matmul(vector, self.n2n2.projection_matrix)
+                batch_tensor = torch.matmul(batch_tensor, self.n2n2.projection_matrix)
                 
             # Normalize
-            vector = torch.tanh(vector)
+            batch_tensor = torch.tanh(batch_tensor)
             
-            # 2. Forward Pass & Learn
-            loss_val = 0.1 # Default
-            reward = 1.0
-            if hasattr(broca, 'process_text_embedding'):
-                _, surprise = broca.process_text_embedding(vector, reward=reward)
-                loss_val = surprise
+            # Train on Batch
+            loss, surprise = broca.train_on_batch(batch_tensor, optimizer)
             
-            if isinstance(loss_val, torch.Tensor):
-                loss_val = loss_val.item()
-            total_loss += loss_val
+            total_loss += loss
+            total_surprise += surprise
             count += 1
             
-        return total_loss / max(1, count)
+        return total_loss / max(1, count) if count > 0 else 0.0
 
 def start_qwen3_n2n2():
     print("--- N2N2: Qwen-3 235B (MoE) Knowledge Transfer ---")

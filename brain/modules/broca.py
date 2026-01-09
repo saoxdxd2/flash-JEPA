@@ -26,12 +26,14 @@ class BrocaModule(nn.Module):
       This allows the model to scale in knowledge (experts) without increasing inference cost.
     - Memory: Titans Neural Memory (Surprise-based learning).
     """
-    def __init__(self, embedding_dim=256, visual_dim=256, num_experts=8, active_experts=1, genome=None):
+    def __init__(self, embedding_dim=None, visual_dim=None, num_experts=8, active_experts=1, genome=None):
         super().__init__()
-        self.embedding_dim = embedding_dim
+        self.genome = genome
+        # Use genomic latent_dim if available, otherwise fallback to 256
+        self.embedding_dim = embedding_dim if embedding_dim is not None else (getattr(genome, 'latent_dim', 256))
+        self.visual_dim = visual_dim if visual_dim is not None else self.embedding_dim
         self.num_experts = num_experts
         self.active_experts = active_experts
-        self.genome = genome
         
         # 1. Visual Word Form Area (VWFA) Simulation
         # Replaced Linear with Conv2d for Natural OCR (2D Topology)
@@ -59,22 +61,20 @@ class BrocaModule(nn.Module):
         # Hidden: 512 (Reservoir) per expert
         # Output: 256 (Semantic Vector)
         self.experts = nn.ModuleList([
-            VectorizedLiquidGraph(input_size=64, hidden_size=512, output_size=embedding_dim)
+            VectorizedLiquidGraph(input_size=64, hidden_size=512, output_size=self.embedding_dim)
             for _ in range(num_experts)
         ])
         
-        # 3. Titans Neural Memory (Long-Term Surprise Memory)
-        # Learns to predict the *semantic output* sequence.
         # Input: 256 (Semantic) -> Output: 256 (Predicted Next Semantic)
-        self.titans = TitansMemory(input_dim=embedding_dim, hidden_dim=embedding_dim)
+        self.titans = TitansMemory(input_dim=self.embedding_dim, hidden_dim=self.embedding_dim)
         
         # 4. Vocabulary (Dynamic - No hardcoded limits)
         # We rely on the SNN to learn representations for any text sequence.
         self.vocab = []
         
         # 5. N2N2 Adapter (Concept -> Input Space)
-        # Projects high-dim concepts (256) down to input space (64) for "Imprinting"
-        self.n2n2_projection = nn.Linear(embedding_dim, 64)
+        # Projects high-dim concepts (embedding_dim) down to input space (64) for "Imprinting"
+        self.n2n2_projection = nn.Linear(self.embedding_dim, 64)
         
         # 6. Lexical Knowledge (Dictionary)
         self.register_buffer('lexical_knowledge', None)
@@ -83,7 +83,11 @@ class BrocaModule(nn.Module):
         self.sequential_mode = False
         
         # 8. Context Tracking
-        self.register_buffer('last_context', torch.zeros(embedding_dim))
+        self.register_buffer('last_context', torch.zeros(self.embedding_dim))
+        
+        # 9. Dynamic Growth Tracking
+        self.surprise_history = []
+        self.expert_usage = torch.zeros(num_experts)
         
     def reset_state(self):
         """Resets the state of all experts and memory."""
@@ -201,10 +205,13 @@ class BrocaModule(nn.Module):
             
         # Titans Memory Update (Surprise!)
         # We observe the final semantic state.
-        self.titans.observe(final_output.detach())
+        surprise = self.titans.observe(final_output.detach())
         
         # Update Context
         self.last_context = final_output.detach()
+        
+        # Dynamic Growth Check
+        self._check_growth(surprise)
             
         return final_output.detach()
 
@@ -284,12 +291,17 @@ class BrocaModule(nn.Module):
                     sample_k_indices = k_indices[batch_indices == b_idx]
                     for k_idx in sample_k_indices:
                         combined_output[b_idx] += expert_out[j] * weights[b_idx, k_idx]
+                        # Update usage tracking
+                        self.expert_usage[i] += weights[b_idx, k_idx].item()
 
         # Normalize output to [-1, 1] for stable TitansMemory observation
         combined_output = torch.tanh(combined_output)
         
         # Titans Update (Batched)
         surprise = self.titans.observe(combined_output.detach())
+        
+        # Dynamic Growth Check
+        self._check_growth(surprise)
             
         return combined_output, surprise
 
@@ -312,6 +324,30 @@ class BrocaModule(nn.Module):
             return combined_output, surprise
         else:
             return combined_output[0], surprise
+
+    def train_on_batch(self, embedding_batch, optimizer, use_ewc=False, hyper_transfer=None):
+        """
+        Trains the Broca module on a batch of embeddings.
+        Reconstruction loss: Output should match Input.
+        """
+        self.train()
+        optimizer.zero_grad()
+        
+        # Forward pass
+        output, surprise = self.process_text_embedding(embedding_batch)
+        
+        # Reconstruction Loss (MSE)
+        # embedding_batch is [Batch, 256], output is [Batch, 256]
+        loss = F.mse_loss(output, embedding_batch)
+        
+        # Optional EWC Loss
+        if use_ewc and hyper_transfer:
+            loss += hyper_transfer.ewc_loss()
+            
+        loss.backward()
+        optimizer.step()
+        
+        return loss.item(), surprise.mean().item() if isinstance(surprise, torch.Tensor) else surprise
 
     def seed_knowledge(self, concepts_tensor):
         """
@@ -559,4 +595,92 @@ class BrocaModule(nn.Module):
         Returns the latest semantic context (last_context buffer).
         """
         return self.last_context
+
+    def _check_growth(self, surprise):
+        """Monitors surprise and triggers sprouting if needed."""
+        if self.genome is None:
+            return
+            
+        # Track surprise in a rolling window
+        if isinstance(surprise, torch.Tensor):
+            avg_surprise = surprise.mean().item()
+        else:
+            avg_surprise = surprise
+            
+        self.surprise_history.append(avg_surprise)
+        if len(self.surprise_history) > 100:
+            self.surprise_history.pop(0)
+            
+        # Trigger Sprouting if surprise is consistently high
+        if len(self.surprise_history) >= 50:
+            rolling_avg = sum(self.surprise_history) / len(self.surprise_history)
+            if rolling_avg > self.genome.sprouting_threshold:
+                if self.num_experts < self.genome.max_experts:
+                    self.sprout_expert()
+                    self.surprise_history = [] # Reset after sprouting
+
+    def sprout_expert(self):
+        """Adds a new expert to the MoE pool (Neurogenesis)."""
+        print(f"BrocaModule: Sprouting new expert {self.num_experts} due to high surprise...")
+        
+        # 1. Create new expert
+        # We can clone the best expert or start fresh. Let's start fresh for diversity.
+        new_expert = VectorizedLiquidGraph(
+            input_size=64, 
+            hidden_size=512, 
+            output_size=self.embedding_dim
+        ).to(next(self.parameters()).device)
+        
+        self.experts.append(new_expert)
+        self.num_experts += 1
+        
+        # 2. Resize Gating Network
+        old_gate = self.gate
+        self.gate = nn.Linear(old_gate.in_features, self.num_experts).to(old_gate.weight.device)
+        
+        with torch.no_grad():
+            # Copy old weights
+            self.gate.weight[:old_gate.out_features, :] = old_gate.weight
+            self.gate.bias[:old_gate.out_features] = old_gate.bias
+            # Initialize new expert logit to be slightly lower to avoid immediate dominance
+            self.gate.weight[old_gate.out_features:, :] = 0.0
+            self.gate.bias[old_gate.out_features:] = -1.0 
+            
+        # 3. Update usage tracking
+        self.expert_usage = torch.cat([self.expert_usage, torch.zeros(1)])
+        
+        print(f"BrocaModule: Neurogenesis complete. Total experts: {self.num_experts}")
+
+    def prune_experts(self, threshold=0.01):
+        """Removes experts that are rarely used (Apoptosis)."""
+        if self.num_experts <= 1:
+            return
+            
+        # Identify low-usage experts
+        # Note: expert_usage should be updated in forward pass (omitted for brevity in this chunk)
+        low_usage_indices = torch.where(self.expert_usage < threshold)[0]
+        
+        if len(low_usage_indices) > 0:
+            idx_to_remove = low_usage_indices[0].item()
+            print(f"BrocaModule: Pruning expert {idx_to_remove} due to low usage...")
+            
+            # Remove from ModuleList
+            new_experts = nn.ModuleList([e for i, e in enumerate(self.experts) if i != idx_to_remove])
+            self.experts = new_experts
+            self.num_experts -= 1
+            
+            # Resize Gate
+            old_gate = self.gate
+            self.gate = nn.Linear(old_gate.in_features, self.num_experts).to(old_gate.weight.device)
+            
+            with torch.no_grad():
+                # Copy weights, skipping the pruned one
+                keep_indices = [i for i in range(old_gate.out_features) if i != idx_to_remove]
+                self.gate.weight.data = old_gate.weight.data[keep_indices]
+                self.gate.bias.data = old_gate.bias.data[keep_indices]
+                
+            # Update usage tracking
+            self.expert_usage = self.expert_usage[keep_indices]
+            
+            print(f"BrocaModule: Expert {idx_to_remove} pruned. Total experts: {self.num_experts}")
 

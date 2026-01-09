@@ -82,91 +82,107 @@ class SparseVectorizedLiquidGraph(nn.Module):
             
         batch_size = inputs.size(0)
         
-        # 1. Concatenate Inputs and Recurrent State
-        # inputs: [Batch, Input]
-        # y: [Hidden] -> Broadcast to [Batch, Hidden]
-        prev_y = self.y.unsqueeze(0).expand(batch_size, -1)
+        # Call ONNX-friendly forward (using dense weights for ONNX compatibility)
+        # In regular execution, we use the sparse path, but for ONNX we need dense.
+        # However, for regular forward, we still want to use the sparse logic.
+        # So we'll keep the sparse logic here but offer forward_onnx for export.
         
-        # Combined: [Batch, Input + Hidden]
+        # 1. Concatenate Inputs and Recurrent State
+        prev_y = self.y.unsqueeze(0).expand(batch_size, -1)
         combined_input = torch.cat([inputs, prev_y], dim=1)
         
         # 2. Sparse Matrix Multiplication
-        # W: [Hidden, Total_In]
-        
-        # Rebuild Cache if needed
-        if self._needs_rebuild or self._cached_W is None:
-            # Construct Sparse Tensor and coalesce to ensure order
-            W_coo = torch.sparse_coo_tensor(
-                self.weight_indices, 
-                self.weight_values, 
-                (self.hidden_size, self.input_size + self.hidden_size),
-                device=self.device
-            ).coalesce()
+        if self._needs_rebuild or self._cached_W is None or self._cached_W.device != inputs.device:
+            with torch.no_grad():
+                W_coo = torch.sparse_coo_tensor(
+                    self.weight_indices.to(inputs.device), 
+                    self.weight_values.detach(), 
+                    (self.hidden_size, self.input_size + self.hidden_size),
+                    device=inputs.device
+                ).coalesce()
+                W_csr = W_coo.to_sparse_csr()
+                self.register_buffer('_crow_indices', W_csr.crow_indices(), persistent=False)
+                self.register_buffer('_col_indices', W_csr.col_indices(), persistent=False)
+                self._needs_rebuild = False
             
-            # Convert to CSR for much faster CPU inference
-            W_csr = W_coo.to_sparse_csr()
-            self._cached_W = W_csr
-            self.register_buffer('_crow_indices', W_csr.crow_indices())
-            self.register_buffer('_col_indices', W_csr.col_indices())
-            self._needs_rebuild = False
-        else:
-            # O(K) update: reuse CSR structure with new values
             self._cached_W = torch.sparse_csr_tensor(
                 self._crow_indices,
                 self._col_indices,
                 self.weight_values,
                 size=(self.hidden_size, self.input_size + self.hidden_size),
-                device=self.device
+                device=inputs.device
+            )
+        else:
+            self._cached_W = torch.sparse_csr_tensor(
+                self._crow_indices,
+                self._col_indices,
+                self.weight_values,
+                size=(self.hidden_size, self.input_size + self.hidden_size),
+                device=inputs.device
             )
             
         W = self._cached_W
-        
-        # Sparse MM
-        # Note: torch.sparse.mm requires (Sparse, Dense)
-        # W is Sparse [H, T], I.T is Dense [T, B]
-        # Result: [H, B]
         activation_in = torch.sparse.mm(W, combined_input.t()).t() # [B, H]
         
         # 3. Apply Dynamics
-        # dx = (-x + activation_in + bias) / tau * dt
-        # Euler integration
-        
-        # Expand params for batch
         tau = self.tau.unsqueeze(0)
         bias = self.bias.unsqueeze(0)
         
         dx = (-self.x + activation_in + bias) / tau * dt
         new_x = self.x + dx
         
-        # 4. Activation Functions (Vectorized Masking)
-        # This part is still O(N), but efficient on GPU
+        # 4. Activation Functions
         tanh_out = torch.tanh(new_x) * self.act_tanh_mask
         sig_out = torch.sigmoid(new_x) * self.act_sig_mask
         relu_out = torch.relu(new_x) * self.act_relu_mask
-        
         new_y = tanh_out + sig_out + relu_out
         
-        # Update State (Detached from graph for state persistence)
-        # self.x is [Hidden]. new_x is [Batch, Hidden].
-        # We assume Batch=1 for the persistent state.
+        # Update State
         if batch_size == 1:
             self.x.copy_(new_x.detach().squeeze(0))
             self.y.copy_(new_y.detach().squeeze(0))
-        else:
-            # If batch > 1, we can't easily persist state for "the" brain.
-            # We just update with the mean? Or don't update?
-            # For training (dreaming), we might run batch > 1, but we don't persist that state.
-            pass
         
         # 5. Output
-        # Gather output neurons
         outputs = new_y[:, self.output_mapping]
-        
-        # Calculate Energy (Metabolic Cost)
-        # L1 norm of activity + synaptic operations
         energy = torch.sum(torch.abs(new_y)) * 0.001
         
         return outputs, new_x, energy
+
+    def forward_onnx(self, inputs, x, y, dt=0.1):
+        """
+        ONNX-friendly forward pass. Stateless and uses dense weights.
+        """
+        batch_size = inputs.size(0)
+        
+        # 1. Concatenate Inputs and Recurrent State
+        prev_y = y # y is already [Batch, Hidden] for ONNX
+        combined_input = torch.cat([inputs, prev_y], dim=1)
+        
+        # 2. Dense Matrix Multiplication (ONNX friendly)
+        # We convert sparse to dense here for the export trace using traceable operations
+        W_dense = torch.zeros(self.hidden_size, self.input_size + self.hidden_size, device=self.weight_values.device)
+        W_dense.index_put_((self.weight_indices[0], self.weight_indices[1]), self.weight_values)
+        
+        activation_in = F.linear(combined_input, W_dense)
+        
+        # 3. Apply Dynamics
+        tau = self.tau.unsqueeze(0)
+        bias = self.bias.unsqueeze(0)
+        
+        dx = (-x + activation_in + bias) / tau * dt
+        next_x = x + dx
+        
+        # 4. Activation Functions
+        tanh_out = torch.tanh(next_x) * self.act_tanh_mask
+        sig_out = torch.sigmoid(next_x) * self.act_sig_mask
+        relu_out = torch.relu(next_x) * self.act_relu_mask
+        next_y = tanh_out + sig_out + relu_out
+        
+        # 5. Output
+        outputs = next_y[:, self.output_mapping]
+        energy = torch.sum(torch.abs(next_y)) * 0.001
+        
+        return outputs, next_x, next_y, energy
 
     def reset_state(self):
         """Resets the hidden state of the brain."""

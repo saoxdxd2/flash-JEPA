@@ -51,13 +51,13 @@ class HyperTransfer:
         # Unless we want to project channels? Qwen=3, Broca=3. No projection needed.
         
         if not self.is_visual and source_dim > target_dim:
-            print(f"N2N2: Compressing dimensions {source_dim} -> {target_dim} (Deterministic)...")
-            # Create a fixed projection matrix using a seed for consistency
-            g = torch.Generator()
-            g.manual_seed(42)
-            self.projection_matrix = torch.randn(source_dim, target_dim, generator=g) / np.sqrt(target_dim)
+            print(f"N2N2: Initializing Learnable Projection Adapter {source_dim} -> {target_dim}...")
+            # We use a Linear layer as a learnable adapter
+            self.projection_adapter = torch.nn.Linear(source_dim, target_dim).to(self.brain.device)
+            # Initialize with Xavier for better convergence
+            torch.nn.init.xavier_uniform_(self.projection_adapter.weight)
         else:
-            self.projection_matrix = None
+            self.projection_adapter = None
             
         self.source_embeddings = filtered_items
         print(f"N2N2: Ready to imprint {len(filtered_items)} concepts.")
@@ -70,17 +70,16 @@ class HyperTransfer:
             vectors = [torch.tensor(v, dtype=torch.float32) for _, v in filtered_items]
             concepts_tensor = torch.stack(vectors)
             
-            # Apply projection if needed to match Broca's embedding_dim (256)
-            if self.projection_matrix is not None:
-                # Note: projection_matrix here is source_dim -> 64. 
-                # But Broca's seed_knowledge expects 256 (embedding_dim).
-                # We need a projection to 256.
-                source_dim = concepts_tensor.shape[1]
-                target_dim = 256
-                g = torch.Generator()
-                g.manual_seed(42)
-                proj_256 = torch.randn(source_dim, target_dim, generator=g) / np.sqrt(target_dim)
-                concepts_tensor = torch.matmul(concepts_tensor, proj_256)
+            # Apply projection if needed to match Broca's embedding_dim
+            if self.projection_adapter is not None:
+                with torch.no_grad():
+                    # We might need to resize the adapter if Broca's dim changed
+                    if self.projection_adapter.out_features != self.brain.broca.embedding_dim:
+                        self.projection_adapter = torch.nn.Linear(
+                            self.projection_adapter.in_features, 
+                            self.brain.broca.embedding_dim
+                        ).to(self.brain.device)
+                    concepts_tensor = self.projection_adapter(concepts_tensor.to(self.brain.device))
                 
             self.brain.broca.seed_knowledge(concepts_tensor)
         
@@ -182,7 +181,11 @@ class HyperTransfer:
         broca = self.brain.broca
         broca.train() # Ensure training mode
         
-        optimizer = torch.optim.Adam(broca.parameters(), lr=0.001)
+        optimizer_params = list(broca.parameters())
+        if self.projection_adapter is not None:
+            optimizer_params += list(self.projection_adapter.parameters())
+            
+        optimizer = torch.optim.Adam(optimizer_params, lr=0.001)
         
         batch_size = 512 # Massive speedup from batching
         
@@ -204,14 +207,19 @@ class HyperTransfer:
             # Check if Broca's dimensions have changed (e.g., due to growth)
             target_dim = broca.embedding_dim
             if not self.is_visual:
-                if self.projection_matrix is not None:
-                    if self.projection_matrix.shape[1] != target_dim:
-                        print(f"N2N2: Updating Projection Matrix to match Broca's latent dim {target_dim}...")
-                        source_dim = self.projection_matrix.shape[0]
-                        self.projection_matrix = torch.randn(source_dim, target_dim, device=vectors_tensor.device) / np.sqrt(target_dim)
+                if self.projection_adapter is not None:
+                    # Check if Broca's dimensions have changed (e.g., due to growth)
+                    if self.projection_adapter.out_features != target_dim:
+                        print(f"N2N2: Resizing Projection Adapter to match Broca's latent dim {target_dim}...")
+                        old_adapter = self.projection_adapter
+                        self.projection_adapter = torch.nn.Linear(old_adapter.in_features, target_dim).to(vectors_tensor.device)
+                        with torch.no_grad():
+                            min_out = min(old_adapter.out_features, target_dim)
+                            self.projection_adapter.weight[:min_out, :] = old_adapter.weight[:min_out, :]
+                            self.projection_adapter.bias[:min_out] = old_adapter.bias[:min_out]
                     
-                    # Project to Broca's latent space (e.g., 256)
-                    vectors_tensor = torch.matmul(vectors_tensor, self.projection_matrix)
+                    # Project to Broca's latent space
+                    vectors_tensor = self.projection_adapter(vectors_tensor.to(self.brain.device))
                 
                 # Normalize
                 vectors_tensor = torch.tanh(vectors_tensor)
@@ -234,8 +242,21 @@ class HyperTransfer:
             # MSE against target
             reconstruction_loss = torch.nn.functional.mse_loss(output, target)
             
+            # --- Contrastive Imprinting (N2N2 3.0) ---
+            # We want different concepts to produce different activations.
+            # Simple contrastive: Minimize similarity between different samples in batch.
+            if batch_size > 1:
+                # Normalize outputs for cosine similarity
+                norm_out = torch.nn.functional.normalize(output, p=2, dim=1)
+                similarity = torch.mm(norm_out, norm_out.t())
+                # Mask out diagonal (self-similarity)
+                mask = torch.eye(similarity.size(0), device=similarity.device).bool()
+                contrastive_loss = similarity.masked_select(~mask).pow(2).mean()
+            else:
+                contrastive_loss = 0
+            
             # Add EWC Loss
-            total_loss = reconstruction_loss
+            total_loss = reconstruction_loss + 0.1 * contrastive_loss
             if use_ewc:
                 ewc = self.ewc_loss()
                 total_loss += ewc

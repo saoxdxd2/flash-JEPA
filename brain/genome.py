@@ -13,6 +13,20 @@ class Genome:
     SAVE_INTERVAL = 100
     PERIPHERAL_RESOLUTION = 64
     
+    # --- Brain Hyperparameters ---
+    INPUT_BOOST_FACTOR = 20.0 # Default/Legacy
+    SURPRISE_THRESHOLD = 0.5
+    REWARD_THRESHOLD = 100.0
+    GROWTH_RATE_MULTIPLIER = 1.1
+    MAX_HIDDEN_SIZE = 32768
+    REPLAY_BUFFER_CAPACITY = 10000
+    ACTION_COST_BASE = 0.01
+    DISTILLATION_TEMPERATURE = 2.0
+    DISTILLATION_LOSS_WEIGHT = 0.5
+    JEPA_LOSS_WEIGHT = 0.1
+    FISHER_SAMPLE_SIZE = 100 # Default/Legacy
+    CONFIDENCE_THRESHOLD = 0.7 # Threshold for System 1 (ONNX) vs System 2 (PyTorch)
+    
     # --- Evolution Constants ---
     SURVIVAL_RATE = 0.2
     KEEP_GENERATIONS = 2
@@ -62,7 +76,17 @@ class Genome:
         self.stamina_efficiency = random.uniform(0.8, 1.2) # How fast energy drains
         self.resilience = random.uniform(0.1, 0.5)         # Resistance to Suffering
         
-        # 5. Meta-Data
+        # 5. Evolved Heuristics (Previously Hardcoded)
+        self.input_boost_factor = random.uniform(10.0, 30.0)
+        self.action_size = 72 # Start with standard, but can mutate
+        self.latent_adapter_dim = 4096 # Matches Qwen-3/Llama default
+        self.fisher_sample_size = random.randint(50, 200)
+        
+        # 6. Phase 3: Dynamic Expert Sprouting
+        self.sprouting_threshold = random.uniform(0.3, 0.7)
+        self.max_experts = 16
+        
+        # 6. Meta-Data
         self.generation = 0
         self.parent_id = None
 
@@ -112,6 +136,18 @@ class Genome:
             self.plasticity_layers = random.choice([1, 2, 3])
             self.plasticity_activation = random.choice(['tanh', 'relu', 'sigmoid'])
 
+        if random.random() < self.mutation_rate:
+            # Mutate Evolved Heuristics
+            self.input_boost_factor = max(1.0, self.input_boost_factor + random.uniform(-2.0, 2.0))
+            self.fisher_sample_size = max(10, self.fisher_sample_size + random.randint(-10, 10))
+            # Action size mutation is rare and structural
+            if random.random() < 0.1:
+                self.action_size = max(10, self.action_size + random.choice([-8, 8]))
+                
+        if random.random() < self.mutation_rate:
+            # Mutate Sprouting Threshold
+            self.sprouting_threshold = max(0.1, min(1.0, self.sprouting_threshold + random.uniform(-0.1, 0.1)))
+
     def crossover(self, other_genome):
         """
         Creates a child by combining genes from self and other_genome.
@@ -131,6 +167,10 @@ class Genome:
         child.plasticity_hidden_size = random.choice([self.plasticity_hidden_size, other_genome.plasticity_hidden_size])
         child.plasticity_layers = random.choice([self.plasticity_layers, other_genome.plasticity_layers])
         child.plasticity_activation = random.choice([self.plasticity_activation, other_genome.plasticity_activation])
+        
+        # Crossover Sprouting Genes
+        child.sprouting_threshold = random.choice([self.sprouting_threshold, other_genome.sprouting_threshold])
+        child.max_experts = random.choice([self.max_experts, other_genome.max_experts])
         
         return child
 

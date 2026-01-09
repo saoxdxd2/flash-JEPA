@@ -43,14 +43,23 @@ class LifecycleManager:
 
     def phase_imprint_language(self, steps=100):
         """Phase 1a: Imprint Language Concepts from Qwen-3."""
-        print("\n--- PHASE: Language Imprinting ---")
+        print("\n--- PHASE: Language Imprinting (Batched) ---")
         try:
             if not self.qwen_teacher.setup():
                 print("Lifecycle: Qwen-3 Teacher setup failed. Skipping imprinting.")
                 return 0.0
-            loss = self.qwen_teacher.train_step(steps=steps)
-            print(f"Lifecycle: Language Imprinting Loss: {loss:.4f}")
-            return loss
+            
+            total_loss = 0.0
+            # We split the steps into sub-phases to show progress
+            sub_steps = max(1, steps // 10)
+            for i in range(10):
+                loss = self.qwen_teacher.train_step(steps=sub_steps, batch_size=64)
+                total_loss += loss
+                print(f"  > Imprinting Progress {i+1}/10: Loss {loss:.4f}")
+                
+            avg_loss = total_loss / 10
+            print(f"Lifecycle: Language Imprinting Complete. Avg Loss: {avg_loss:.4f}")
+            return avg_loss
         except Exception as e:
             print(f"Lifecycle: ERROR during Language Imprinting: {e}")
             return 0.0
@@ -120,7 +129,10 @@ class LifecycleManager:
             L = self.brain.genome.latent_dim
             full_inputs = torch.zeros(batch_size, self.brain.input_size)
             full_inputs[:, L*2 : L*3] = inputs 
-            _, _, energy = self.brain.trm.forward(full_inputs, dt=1.0)
+            
+            # Use current chemistry for more realistic stabilization
+            chems = self.brain.chemistry.get_state_vector()
+            _, _, energy, _ = self.brain.trm.forward(full_inputs, dt=1.0, chemicals=chems)
             
             # 4. Reward stability and efficiency
             stability_reward = 1.0 / (1.0 + current_surprise)

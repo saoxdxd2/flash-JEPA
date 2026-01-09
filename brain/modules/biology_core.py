@@ -55,10 +55,13 @@ class NeurotransmitterSystem:
             
         # --- Dopamine Dynamics ---
         # Spikes with positive RPE, dips with negative.
-        # Suppressed by Cortisol.
+        # Suppressed by Cortisol, modulated by Serotonin.
         dopamine_delta = reward_prediction_error * 0.5
-        suppression = self.cortisol * 0.5
-        self.dopamine += dopamine_delta - suppression
+        
+        # Serotonin "Brake": High serotonin prevents dopamine spikes from becoming mania
+        serotonin_brake = max(0.0, self.serotonin - 0.5) * 0.5
+        
+        self.dopamine += (dopamine_delta - (self.cortisol * 0.3) - serotonin_brake)
         # Decay towards baseline
         self.dopamine += (self.baseline_dopamine - self.dopamine) * self.decay_rate
         
@@ -67,23 +70,33 @@ class NeurotransmitterSystem:
         # Decays rapidly.
         arousal_spike = (surprise * 0.5) + (pain * 0.5) + (starvation_stress * 0.2)
         self.norepinephrine += arousal_spike
-        self.norepinephrine *= 0.95 # Fast decay
+        self.norepinephrine *= 0.90 # Faster decay for attention spikes
         
         # --- Cortisol Dynamics ---
         # Accumulates with Pain, Sustained Effort, and Starvation.
-        # Decays slowly.
+        # Norepinephrine (Arousal) amplifies Cortisol.
+        # Dopamine (Reward) suppresses Cortisol.
         stress_accumulation = (pain * 0.1) + (effort * 0.01) + (starvation_stress * 0.1)
-        self.cortisol += stress_accumulation
-        self.cortisol *= 0.99 # Slow decay
+        arousal_stress = self.norepinephrine * 0.05
+        reward_relief = self.dopamine * 0.02
+        
+        self.cortisol += stress_accumulation + arousal_stress - reward_relief
+        self.cortisol *= 0.98 # Slower decay for chronic stress
         
         # --- Serotonin Dynamics ---
         # Depleted by Stress (Cortisol).
         # Recovered by "Safety" (Low Surprise, Low Pain).
-        if self.cortisol > 0.5:
-            self.serotonin -= 0.01
-        elif self.cortisol < 0.1 and surprise < 0.1:
-            self.serotonin += 0.005
+        if self.cortisol > 0.4:
+            self.serotonin -= 0.02 * self.cortisol
+        elif self.cortisol < 0.2 and surprise < 0.1:
+            self.serotonin += 0.01 * (1.0 - self.cortisol)
             
+        # --- Metabolic Constraint ---
+        # Low energy reduces all chemical activity
+        energy_factor = max(0.1, self.energy / 100.0)
+        self.dopamine *= energy_factor
+        self.norepinephrine *= energy_factor
+        
         # Clamp values
         self.dopamine = np.clip(self.dopamine, 0.0, 1.0)
         self.serotonin = np.clip(self.serotonin, 0.0, 1.0)

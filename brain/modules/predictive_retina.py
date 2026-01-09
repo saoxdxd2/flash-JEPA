@@ -230,9 +230,14 @@ class PredictiveRetina(nn.Module):
                     # img_gray = img.convert('L') # REMOVED: Keep RGB
                     
                     # 1. Extract Fovea (High Res Patch)
+                    # Sync gaze with actual mouse position if available
+                    import pyautogui
+                    mx, my = pyautogui.position()
+                    self.gaze_x = mx / w
+                    self.gaze_y = my / h
+                    
                     # Calculate pixel coordinates
-                    cx = int(self.gaze_x * w)
-                    cy = int(self.gaze_y * h)
+                    cx, cy = mx, my
                     half_fovea = self.fovea_size // 2
                     
                     # Crop with bounds checking

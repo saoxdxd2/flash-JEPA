@@ -1,0 +1,32 @@
+[
+  {
+    "id": "TC001",
+    "title": "run_lifecycle_cycle_success",
+    "description": "Test the /lifecycle/run_cycle endpoint to verify that a full lifecycle cycle runs successfully through all phases including load, imprint, stabilize, grounding, schooling, consolidation, evolution, and save, returning a 200 status with confirmation."
+  },
+  {
+    "id": "TC002",
+    "title": "start_autonomous_life_loop",
+    "description": "Test the /life/start endpoint to ensure the autonomous life loop starts correctly, managing population wake cycles, sleep/evolution phases, and periodic checkpoint saves, returning a 200 status indicating the loop has started."
+  },
+  {
+    "id": "TC003",
+    "title": "export_reflex_path_to_onnx",
+    "description": "Test the /inference/export_reflex endpoint to confirm that the reflex inference path is exported to a valid ONNX model, returning a 200 status with export confirmation."
+  },
+  {
+    "id": "TC004",
+    "title": "hybrid_inference_decision_switching",
+    "description": "Test the /inference/decide endpoint to verify that the system correctly runs inference using ONNX (System 1) or PyTorch (System 2) paths, switches based on confidence thresholds, and falls back appropriately, returning action and logits with a 200 status."
+  },
+  {
+    "id": "TC005",
+    "title": "imprint_language_concepts_with_qwen",
+    "description": "Test the /transfer/imprint_language endpoint to ensure that language concept imprinting using the Qwen teacher integration completes successfully in batched steps, returning a 200 status confirming the imprinting step."
+  },
+  {
+    "id": "TC006",
+    "title": "run_verification_scripts_success",
+    "description": "Test the /tests/run endpoint to verify that all verification and integrity test scripts execute without errors, validating ONNX export correctness, fallback logic, lifecycle evolution stability, and dynamic growth checks, returning a 200 status upon completion."
+  }
+]

@@ -135,12 +135,17 @@ class Cradle:
             
         return False
 
-    def execute_code(self, code, gaze_pos=(0.5, 0.5)):
+    def execute_code(self, code, gaze_pos=None):
         """
         Executes an integer action code (Evolutionary Interface).
         gaze_pos: (x, y) tuple of current gaze/cursor position for relative movement.
+        If None, fetches actual mouse position.
         """
-        gx, gy = gaze_pos
+        if gaze_pos is None:
+            mx, my = pyautogui.position()
+            gx, gy = mx / self.screen_width, my / self.screen_height
+        else:
+            gx, gy = gaze_pos
         
         try:
             if code == 1: return self.click()
@@ -175,6 +180,14 @@ class Cradle:
             elif code == 67: return self.press_key('down')
             elif code == 68: return self.press_key('left')
             elif code == 69: return self.press_key('right')
+            
+            # Advanced Shortcuts (70+)
+            elif code == 70: return self.press_key('esc')
+            elif code == 71: return self.press_key('tab')
+            elif code == 72: return self.hotkey('ctrl', 'c')
+            elif code == 73: return self.hotkey('ctrl', 'v')
+            elif code == 74: return self.hotkey('alt', 'tab')
+            elif code == 75: return self.hotkey('win', 'r') # Run dialog
             
             return True
         except Exception as e:

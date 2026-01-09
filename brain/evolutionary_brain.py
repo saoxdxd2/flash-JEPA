@@ -15,6 +15,8 @@ from brain.modules.monitor import ResourceMonitor
 from models.ecg import ModularBrain
 from brain.modules.replay_buffer import PrioritizedReplayBuffer
 from brain.modules.cradle import Cradle
+from brain.modules.device import get_best_device, get_memory_stats, check_ram_limit
+from brain.modules.onnx_engine import ONNXEngine
 
 class EvolutionaryBrain:
     """
@@ -35,7 +37,9 @@ class EvolutionaryBrain:
         self.latent_dim = self.genome.latent_dim
         self.input_size = (3 * self.genome.latent_dim) + self.genome.NON_VISUAL_INPUT_SIZE
         self.hidden_size = self.genome.hidden_size 
-        self.action_size = 72 
+        self.action_size = self.genome.action_size 
+        
+        self.device = get_best_device()
         
         # --- Biological Core ---
         self.chemistry = NeurotransmitterSystem()
@@ -43,7 +47,7 @@ class EvolutionaryBrain:
         self.basal_ganglia = BasalGanglia(self.action_size)
         
         # --- Replay Buffer (Unified System 1/2) ---
-        self.replay_buffer = PrioritizedReplayBuffer(capacity=10000)
+        self.replay_buffer = PrioritizedReplayBuffer(capacity=self.genome.REPLAY_BUFFER_CAPACITY)
         self.prev_state = None
         self.prev_action = None
         self.prev_reward = 0.0
@@ -57,16 +61,20 @@ class EvolutionaryBrain:
         self.trm = ModularBrain(self.input_size, self.hidden_size, self.action_size, genome=self.genome, use_neuromodulated=True)
         self.trm.set_plasticity(self.genome.plasticity_coefficients, self.genome.learning_rate)
         self.retina = PredictiveRetina(latent_size=self.genome.latent_dim, genome=self.genome)
-        self.broca = BrocaModule(embedding_dim=self.genome.latent_dim, genome=self.genome)
+        self.broca = BrocaModule(
+            embedding_dim=self.genome.latent_dim, 
+            visual_dim=self.genome.latent_dim,
+            genome=self.genome
+        ).to(self.device)
         self.memory = self.replay_buffer 
         
         # --- 8. Latent Adapter (N2N2 Alignment) ---
-        # Maps teacher embeddings (e.g. 4096) to our latent_dim (1024)
+        # Maps teacher embeddings (e.g. 4096) to our latent_dim
         self.latent_adapter = nn.Sequential(
-            nn.Linear(4096, 2048),
+            nn.Linear(self.genome.latent_adapter_dim, 2048),
             nn.ReLU(),
             nn.Linear(2048, self.latent_dim)
-        )
+        ).to(self.device)
         
         # --- 9. Optimizers ---
         self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate * 2.0)
@@ -76,10 +84,10 @@ class EvolutionaryBrain:
         self.monitor = ResourceMonitor()
         
         # Set RAM Limit
-        import psutil
-        sys_ram = psutil.virtual_memory().total / (1024 * 1024)
+        mem_stats = get_memory_stats()
+        sys_ram = mem_stats["sys_total"]
         self.genome.max_ram_mb = min(12288, int(sys_ram * 0.75))
-        print(f"EvolutionaryBrain: RAM Limit set to {self.genome.max_ram_mb}MB")
+        print(f"EvolutionaryBrain: RAM Limit set to {self.genome.max_ram_mb}MB on {self.device}")
         
         # Metrics
         self.accumulated_reward = 0.0
@@ -87,6 +95,12 @@ class EvolutionaryBrain:
         self.age = 0
         self.stamina = 1.0
         self.last_surprise = 0.0
+        
+        # --- ONNX Optimization ---
+        self.use_onnx = False
+        self.onnx_engine = None
+        self.onnx_path = "reflex_path.onnx"
+        self.onnx_states = None # Persistent states for ONNX
 
     def start(self):
         print("Brain: Waking up...")
@@ -107,7 +121,7 @@ class EvolutionaryBrain:
             full_input_tensor = full_input_tensor.unsqueeze(0)
             
         boosted_input = full_input_tensor.clone()
-        boosted_input[:, :3*L] *= 20.0
+        boosted_input[:, :3*L] *= self.genome.INPUT_BOOST_FACTOR
         
         chemicals = torch.tensor([
             self.chemistry.dopamine,
@@ -116,10 +130,62 @@ class EvolutionaryBrain:
             self.chemistry.cortisol
         ], device=boosted_input.device).unsqueeze(0)
         
-        res = self.trm.forward(boosted_input, chemicals=chemicals, train_internal_rl=train_internal_rl)
-        logits, value, energy, flash_info = res
+        # 2. Forward Pass
+        if self.use_onnx and self.onnx_engine is not None:
+            # ONNX Inference (Reflex Path)
+            if self.onnx_states is None:
+                self._init_onnx_states()
+            
+            onnx_inputs = {
+                'input': boosted_input.cpu().numpy(),
+                'chemicals': chemicals.cpu().numpy()
+            }
+            for i, name in enumerate(self.onnx_engine.session.get_inputs()[2:]):
+                onnx_inputs[name.name] = self.onnx_states[i]
+            
+            outputs = self.onnx_engine.run(onnx_inputs)
+            logits_np = outputs[0]
+            params_np = outputs[1]
+            confidence_np = outputs[2]
+            self.onnx_states = outputs[3:]
+            
+            confidence = torch.from_numpy(confidence_np).to(self.device)
+            
+            # Hybrid Switching: If confidence is low, fallback to System 2 (PyTorch)
+            if confidence.mean().item() < self.genome.CONFIDENCE_THRESHOLD:
+                res = self.trm.forward(boosted_input, chemicals=chemicals, train_internal_rl=train_internal_rl)
+                logits, value, energy, flash_info = res
+            else:
+                logits = torch.from_numpy(logits_np).to(self.device)
+                value = torch.from_numpy(params_np).to(self.device)
+                energy = torch.tensor(0.0, device=self.device) # Placeholder
+                # Provide dummy flash_info for Basal Ganglia
+                # (flash_actions, confidence, p_reflex, p_concept, p_strategy, next_h_reflex, next_h_concept, next_h_strategy)
+                dummy_flash = (logits, confidence, None, None, None, None, None, None)
+                flash_info = dummy_flash
+        else:
+            res = self.trm.forward(boosted_input, chemicals=chemicals, train_internal_rl=train_internal_rl)
+            logits, value, energy, flash_info = res
+        self.last_value = value.mean().item() if torch.is_tensor(value) else value
         
         surprise = getattr(self, 'last_surprise', 0.0)
+        
+        # --- 4. Amygdala Hijack Check ---
+        # Immediate threat response (Overrides Cortex)
+        hijack, reflex_action = self.amygdala.process(
+            surprise, 
+            0.0, # Pain (Placeholder)
+            self.chemistry.get_state_vector()
+        )
+        
+        if hijack and not disable_reflex:
+            self.last_used_system = 0 # 0 for Amygdala
+            # Create a one-hot or similar logit vector for the reflex action
+            reflex_logits = torch.zeros_like(logits)
+            reflex_logits[0, reflex_action] = 10.0
+            return reflex_action, reflex_logits
+            
+        # --- 5. Basal Ganglia Gating (System 1 vs 2) ---
         action, used_system = self.basal_ganglia.gate_action(
             logits, 
             self.chemistry.dopamine, 
@@ -160,9 +226,9 @@ class EvolutionaryBrain:
             
         L = self.latent_dim
         boosted_states = states.clone()
-        boosted_states[:, :3*L] *= 20.0
+        boosted_states[:, :3*L] *= self.genome.INPUT_BOOST_FACTOR
         boosted_next_states = next_states.clone()
-        boosted_next_states[:, :3*L] *= 20.0
+        boosted_next_states[:, :3*L] *= self.genome.INPUT_BOOST_FACTOR
         
         self.trm_optimizer.zero_grad()
         chemicals = torch.zeros(states.shape[0], 4, device=states.device)
@@ -171,11 +237,12 @@ class EvolutionaryBrain:
         self.trm.detach_state()
         
         res = self.trm.forward(boosted_states, chemicals=chemicals)
-        logits, value, _, (flash_logits, flash_conf, p_reflex, p_concept, p_strategy) = res
+        logits, value, _, (flash_logits, flash_conf, p_reflex, p_concept, p_strategy, h_reflex, h_concept, h_strategy) = res
         
         with torch.no_grad():
             res_next = self.trm.forward(boosted_next_states, chemicals=chemicals)
-            _, _, _, (_, _, t_reflex, t_concept, t_strategy) = res_next
+            # We want the ACTUAL hidden states of the next step as targets for JEPA
+            _, _, _, (_, _, _, _, _, t_reflex, t_concept, t_strategy) = res_next
         
         # 1. Standard RL Losses
         policy_loss = F.cross_entropy(logits, actions)
@@ -183,6 +250,7 @@ class EvolutionaryBrain:
         value_loss = F.mse_loss(value.squeeze(), rewards)
         
         try:
+            # JEPA Loss: Predict the NEXT hidden state
             jepa_loss = F.mse_loss(p_reflex, t_reflex) + \
                         F.mse_loss(p_concept, t_concept) + \
                         F.mse_loss(p_strategy, t_strategy)
@@ -196,12 +264,12 @@ class EvolutionaryBrain:
         # 2. Distillation Loss (System 2 -> System 1)
         distill_loss = 0.0
         if distillation:
-            T = 2.0
+            T = self.genome.DISTILLATION_TEMPERATURE
             p_s1 = F.log_softmax(flash_logits / T, dim=1)
             p_s2 = F.softmax(logits / T, dim=1)
             distill_loss = F.kl_div(p_s1, p_s2, reduction='batchmean') * (T**2)
             
-        total_loss = policy_loss + flash_loss + value_loss + (jepa_loss * 0.1) + (distill_loss * 0.5)
+        total_loss = policy_loss + flash_loss + value_loss + (jepa_loss * self.genome.JEPA_LOSS_WEIGHT) + (distill_loss * self.genome.DISTILLATION_LOSS_WEIGHT)
         
         if torch.isnan(total_loss):
             print("DEBUG: NaN Loss detected!")
@@ -265,7 +333,7 @@ class EvolutionaryBrain:
         
         return full_input
 
-    def wake_cycle(self, reward=0.0):
+    def wake_cycle(self, reward=0.0, pain=0.0):
         # 1. Get Latest Vision Data from Retina
         vision_data = self.retina.get_latest_input()
         if vision_data is None:
@@ -300,7 +368,8 @@ class EvolutionaryBrain:
         action, _ = self.decide(full_input)
         
         # 5. Execute Action
-        self.cradle.execute_code(action)
+        gaze_pos = (self.retina.gaze_x, self.retina.gaze_y)
+        self.cradle.execute_code(action, gaze_pos=gaze_pos)
         
         # 6. Update Replay Buffer (Experience Replay)
         if self.prev_state is not None:
@@ -311,18 +380,19 @@ class EvolutionaryBrain:
         self.prev_action = action
         self.prev_reward = reward
         
-        # Update chemistry based on effort
-        self.chemistry.update(reward, action_cost=0.01) # Basic cost
+        # 8. Update chemistry based on effort and sensory feedback
+        rpe = reward - getattr(self, 'last_value', 0.0)
+        self.chemistry.update(
+            reward_prediction_error=rpe, 
+            surprise=surprise, 
+            pain=pain, 
+            effort=self.genome.ACTION_COST_BASE
+        )
+        
+        # 9. Increment Age
+        self.age += 1
         
         return action
-
-    def dream(self, steps=10):
-        print(f"Brain: Dreaming (Distillation Mode) for {steps} steps...")
-        for _ in range(steps):
-            self.train_step(distillation=True)
-            
-        # --- Structural Plasticity: Check for Growth ---
-        self.check_growth_triggers()
         
     def check_growth_triggers(self):
         """
@@ -331,15 +401,15 @@ class EvolutionaryBrain:
         # Triggers:
         # 1. High Surprise: Model is struggling to predict (needs more capacity)
         # 2. High Reward: Model has found a good strategy (needs to lock it in)
-        surprise_threshold = 0.5
-        reward_threshold = 100.0
+        surprise_threshold = self.genome.SURPRISE_THRESHOLD
+        reward_threshold = self.genome.REWARD_THRESHOLD
         
         if self.last_surprise > surprise_threshold or self.accumulated_reward > reward_threshold:
             print(f"Brain: Growth Triggered! (Surprise: {self.last_surprise:.4f}, Reward: {self.accumulated_reward:.2f})")
-            # Expand hidden size by 10%
-            new_hidden = int(self.hidden_size * 1.1)
-            # Cap at 32k for CPU efficiency
-            new_hidden = min(new_hidden, 32768)
+            # Expand hidden size
+            new_hidden = int(self.hidden_size * self.genome.GROWTH_RATE_MULTIPLIER)
+            # Cap for CPU efficiency
+            new_hidden = min(new_hidden, self.genome.MAX_HIDDEN_SIZE)
             
             if new_hidden > self.hidden_size:
                 self.trm.resize_hidden(new_hidden)
@@ -348,6 +418,85 @@ class EvolutionaryBrain:
                 self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate)
                 # Reset reward to avoid immediate re-trigger
                 self.accumulated_reward = 0.0
+
+    def dream(self, steps=10):
+        """Dreaming phase: Consolidation and System 2 -> System 1 distillation."""
+        print(f"Brain: Dreaming (Distillation Mode) for {steps} steps...")
+        for _ in range(steps):
+            self.train_step(distillation=True)
+            
+        # --- Structural Plasticity: Check for Growth ---
+        self.check_growth_triggers()
+    
+    def mutate_adaptive(self, fitness_ratio):
+        """Adaptive mutation based on fitness performance."""
+        # Only mutate if underperforming
+        if fitness_ratio < 0.5:
+            self.genome.mutate()
+            print(f"Brain: Adaptive mutation triggered (fitness_ratio={fitness_ratio:.2f})")
+
+    def crossover(self, other_brain):
+        """
+        N2N2-style crossover: Creates a child brain by averaging weights with another brain.
+        
+        Args:
+            other_brain: Another EvolutionaryBrain to crossover with.
+            
+        Returns:
+            child_brain: A new EvolutionaryBrain with mixed genetics.
+        """
+        # Create child with averaged genome
+        child_genome = self.genome.crossover(other_brain.genome)
+        child_brain = EvolutionaryBrain(child_genome)
+        
+        # Weight averaging (N2N2 crossover)
+        my_state = self.trm.state_dict()
+        other_state = other_brain.trm.state_dict()
+        child_state = child_brain.trm.state_dict()
+        
+        for key in child_state.keys():
+            if key in my_state and key in other_state:
+                if my_state[key].shape == other_state[key].shape == child_state[key].shape:
+                    # Average the weights
+                    alpha = 0.5 + (random.random() - 0.5) * 0.2  # 0.4 to 0.6
+                    child_state[key] = alpha * my_state[key] + (1 - alpha) * other_state[key]
+                    
+        child_brain.trm.load_state_dict(child_state, strict=False)
+        return child_brain
+
+
+    def export_reflex_path(self, path=None):
+        """
+        Freezes the current brain and exports the Reflex path to ONNX.
+        """
+        if path is None: path = self.onnx_path
+        print(f"Brain: Exporting Reflex Path to {path}...")
+        
+        # Ensure model is in eval mode
+        self.trm.eval()
+        
+        success = self.trm.to_onnx(path)
+        if success:
+            print("Brain: ONNX Export Successful.")
+            self.onnx_engine = ONNXEngine(path)
+            self.onnx_path = path
+            self._init_onnx_states()
+        else:
+            print("Brain: ONNX Export Failed.")
+        return success
+
+    def _init_onnx_states(self):
+        """Initializes persistent states for ONNX inference."""
+        if self.onnx_engine is None: return
+        
+        self.onnx_states = []
+        # Get state shapes from ONNX inputs (skipping input and chemicals)
+        for input_meta in self.onnx_engine.session.get_inputs()[2:]:
+            shape = input_meta.shape
+            # Replace dynamic batch with 1
+            fixed_shape = [1 if isinstance(s, str) or s is None else s for s in shape]
+            self.onnx_states.append(np.zeros(fixed_shape, dtype=np.float32))
+        print(f"Brain: Initialized {len(self.onnx_states)} ONNX states.")
 
     @staticmethod
     def find_latest_checkpoint(directory):
@@ -394,7 +543,7 @@ class EvolutionaryBrain:
         if target_latent != self.latent_dim or target_hidden != self.hidden_size:
             print(f"Brain: Schema mismatch detected (Latent: {self.latent_dim}->{target_latent}, Hidden: {self.hidden_size}->{target_hidden})")
             print("Brain: Clearing replay buffer to avoid shape errors.")
-            self.replay_buffer = PrioritizedReplayBuffer(capacity=10000)
+            self.replay_buffer = PrioritizedReplayBuffer(capacity=self.genome.REPLAY_BUFFER_CAPACITY)
             
             if target_latent != self.latent_dim:
                 self.resize_latent(target_latent)

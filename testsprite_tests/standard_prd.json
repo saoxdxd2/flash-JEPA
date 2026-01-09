@@ -1,0 +1,214 @@
+{
+  "meta": {
+    "project": "Flash-JEPA",
+    "date": "2025-12-30",
+    "prepared_by": "Software Development Manager"
+  },
+  "product_overview": "Flash-JEPA is an advanced research codebase designed to develop a biologically-inspired agentic AI. It leverages Python and PyTorch to simulate an EvolutionaryBrain with multi-phase lifecycle training and hybrid inference support, aiming to model complex AI behaviors. The system orchestrates population-based autonomous life cycles and supports knowledge transfer mechanisms along with robust verification processes.",
+  "core_goals": [
+    "Develop a biologically-inspired agentic AI system using evolutionary principles.",
+    "Implement a lifecycle training pipeline that includes imprinting, stabilization, grounding, schooling, consolidation/dreaming, and evolution phases.",
+    "Enable autonomous population-based agent life loops with checkpoint management and evolutionary cycles.",
+    "Support hybrid inference with ONNX-exported reflex paths alongside PyTorch computation for dynamic decision making.",
+    "Implement knowledge transfer mechanisms to enable hyper-stimulation and imprinting from teacher models.",
+    "Provide comprehensive verification and integrity testing to ensure system stability, model correctness, and fallback robustness."
+  ],
+  "key_features": [
+    "Lifecycle Pipeline: Multi-phase training involving imprinting, stabilization, grounding, schooling, consolidation/dreaming, and evolution.",
+    "Autonomous Life Loop (Population Mode): Runs a live agent loop managing populations of genomes with checkpoint saves and evolutionary cycle progression.",
+    "ONNX Export and Hybrid Inference Path: Exports reflex inference paths to ONNX format and supports switching between ONNX (System 1) and PyTorch (System 2) based on model confidence.",
+    "N2N2 / Knowledge Transfer: Implements mechanisms for knowledge transfer and hyper-stimulation during imprinting and transfer phases using Qwen teacher integration.",
+    "Verification and Integrity Testing: Provides standalone scripts to validate ONNX export, fallback logic, lifecycle evolution stability, and dynamic growth checks.",
+    "Multi-Module EvolutionaryBrain Architecture: Includes brain modules like Broca, Basal Ganglia, Amygdala, and Neural Memory to model biologically inspired cognition."
+  ],
+  "user_flow_summary": [
+    "User triggers the lifecycle pipeline to run a full cycle consisting of load, imprint, stabilize, grounding, schooling, consolidation, evolution, and save phases.",
+    "User starts the autonomous life loop which continuously manages a population of genomes, performing wake and sleep cycles with evolution and periodic checkpointing.",
+    "User exports the reflex inference path to ONNX format to enable fast execution and starts inference which dynamically switches between the ONNX and PyTorch paths depending on confidence levels.",
+    "User performs language concept imprinting leveraging Qwen teacher integration to perform batched imprinting steps via the knowledge transfer subsystem.",
+    "Development team runs verification and integrity test scripts that check export correctness, fallback behaviors, and growth stability across different system components.",
+    "Users monitor and update brain modules during training and evolution, ensuring the lifecycle phases execute correctly and effectively evolve agentic AI capabilities."
+  ],
+  "validation_criteria": [
+    "Successful execution of all lifecycle phases with expected transitions and data integrity.",
+    "Autonomous life loop operates continuously without crashes, successfully saving checkpoints and evolving populations over generations.",
+    "ONNX export produces a valid and runnable model interoperable with PyTorch hybrid inference.",
+    "Hybrid inference decisions switch confidently between ONNX and PyTorch paths, with fallbacks triggered appropriately based on confidence thresholds.",
+    "Knowledge transfer imprinting completes successfully using Qwen integration, influencing brain state as expected.",
+    "All verification scripts run without errors and validate critical system properties such as model integrity, dynamic growth stability, and fallback reliability."
+  ],
+  "code_summary": {
+    "tech_stack": [
+      "Python",
+      "PyTorch",
+      "None",
+      "ONNX, psutil, numpy"
+    ],
+    "features": [
+      {
+        "name": "Lifecycle Pipeline",
+        "description": "Orchestrates multi-phase training/evolution cycles: imprinting, stabilization, grounding, schooling, consolidation/dreaming, and evolution.",
+        "files": [
+          "brain/lifecycle.py",
+          "run_lifecycle.py",
+          "brain/evolutionary_brain.py",
+          "brain/genome.py"
+        ],
+        "api_doc": {
+          "openapi": "3.0.3",
+          "info": {
+            "title": "Flash-JEPA Lifecycle Pipeline (Conceptual API)",
+            "version": "1.0.0",
+            "description": "This project is not an HTTP service; this OpenAPI is a conceptual mapping of callable operations."
+          },
+          "paths": {
+            "/lifecycle/run_cycle": {
+              "post": {
+                "summary": "Run one lifecycle cycle",
+                "description": "Runs load -> imprint -> stabilize -> grounding -> schooling -> consolidation -> evolution -> save.",
+                "responses": {
+                  "200": {
+                    "description": "Cycle completed"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "Autonomous Life Loop (Population Mode)",
+        "description": "Runs a live agent loop using a population of genomes, loading/saving checkpoints and evolving over generations.",
+        "files": [
+          "autonomous_life.py",
+          "brain/population.py",
+          "brain/evolutionary_brain.py",
+          "brain/n2n.py"
+        ],
+        "api_doc": {
+          "openapi": "3.0.3",
+          "info": {
+            "title": "Flash-JEPA Autonomous Life (Conceptual API)",
+            "version": "1.0.0",
+            "description": "This project is not an HTTP service; this OpenAPI is a conceptual mapping of callable operations."
+          },
+          "paths": {
+            "/life/start": {
+              "post": {
+                "summary": "Start the autonomous life loop",
+                "description": "Starts the population-based orchestration loop (wake cycles, sleep/evolve, periodic saves).",
+                "responses": {
+                  "200": {
+                    "description": "Loop started"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "ONNX Export + Hybrid Inference Path",
+        "description": "Exports a reflex inference path to ONNX and supports a hybrid decision path that can switch between ONNX (System 1) and PyTorch (System 2).",
+        "files": [
+          "brain/evolutionary_brain.py",
+          "brain/modules/onnx_engine.py",
+          "tests/deep_integrity_test.py",
+          "tests/final_verification.py"
+        ],
+        "api_doc": {
+          "openapi": "3.0.3",
+          "info": {
+            "title": "Flash-JEPA ONNX + Hybrid Inference (Conceptual API)",
+            "version": "1.0.0",
+            "description": "This project is not an HTTP service; this OpenAPI is a conceptual mapping of callable operations."
+          },
+          "paths": {
+            "/inference/export_reflex": {
+              "post": {
+                "summary": "Export reflex path to ONNX",
+                "responses": {
+                  "200": {
+                    "description": "ONNX model exported"
+                  }
+                }
+              }
+            },
+            "/inference/decide": {
+              "post": {
+                "summary": "Decide an action",
+                "description": "Runs either ONNX (System 1) or PyTorch (System 2) and may fall back based on confidence.",
+                "responses": {
+                  "200": {
+                    "description": "Action and logits returned"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "N2N2 / Knowledge Transfer",
+        "description": "Implements knowledge transfer / hyper-stimulation mechanisms used during imprinting and transfer phases.",
+        "files": [
+          "brain/n2n2.py",
+          "scripts/start_n2n2_qwen3_agentic.py",
+          "brain/lifecycle.py"
+        ],
+        "api_doc": {
+          "openapi": "3.0.3",
+          "info": {
+            "title": "Flash-JEPA N2N2 Knowledge Transfer (Conceptual API)",
+            "version": "1.0.0",
+            "description": "This project is not an HTTP service; this OpenAPI is a conceptual mapping of callable operations."
+          },
+          "paths": {
+            "/transfer/imprint_language": {
+              "post": {
+                "summary": "Imprint language concepts",
+                "description": "Uses the Qwen teacher integration (if available) to perform batched imprinting.",
+                "responses": {
+                  "200": {
+                    "description": "Imprinting step completed"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "Verification / Integrity Test Scripts",
+        "description": "Standalone verification scripts for integrity checks (ONNX export, state evolution, fallback logic, dynamic growth stability).",
+        "files": [
+          "tests/deep_integrity_test.py",
+          "tests/final_verification.py",
+          "tests/test_onnx_export.py",
+          "tests/test_sprouting.py"
+        ],
+        "api_doc": {
+          "openapi": "3.0.3",
+          "info": {
+            "title": "Flash-JEPA Verification Scripts (Conceptual API)",
+            "version": "1.0.0",
+            "description": "This project is not an HTTP service; this OpenAPI is a conceptual mapping of runnable verification scripts."
+          },
+          "paths": {
+            "/tests/run": {
+              "post": {
+                "summary": "Run verification scripts",
+                "description": "Represents executing scripts under tests/ as part of validation.",
+                "responses": {
+                  "200": {
+                    "description": "Tests executed"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}
