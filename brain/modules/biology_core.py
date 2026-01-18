@@ -206,11 +206,36 @@ class NeurotransmitterSystem:
         
         # --- Serotonin Dynamics ---
         # params: [stress_thresh, deplet_rate, safety_thresh, recov_rate]
-        serotonin_new = serotonin
-        if cortisol_new > self.serotonin_params[0]:
-            serotonin_new -= self.serotonin_params[1] * cortisol_new
-        elif cortisol_new < self.serotonin_params[2] and surprise < SURPRISE_SAFETY_THRESHOLD:
-            serotonin_new += self.serotonin_params[3] * (1.0 - cortisol_new)
+        # Vectorized conditional update using torch.where
+        
+        # Condition 1: High Cortisol -> Deplete Serotonin
+        # mask_high_stress = cortisol_new > self.serotonin_params[0]
+        # serotonin_new = torch.where(mask_high_stress, serotonin_new - self.serotonin_params[1] * cortisol_new, serotonin_new)
+        
+        # Condition 2: Low Cortisol & Low Surprise -> Recover Serotonin
+        # mask_safety = (cortisol_new < self.serotonin_params[2]) & (surprise < SURPRISE_SAFETY_THRESHOLD)
+        # serotonin_new = torch.where(mask_safety, serotonin_new + self.serotonin_params[3] * (1.0 - cortisol_new), serotonin_new)
+        
+        # Since we are doing in-place updates on a cloned tensor, we can use standard logic if we are careful about shapes
+        # But torch.where is safer for gradients and batching
+        
+        stress_thresh = self.serotonin_params[0]
+        deplet_rate = self.serotonin_params[1]
+        safety_thresh = self.serotonin_params[2]
+        recov_rate = self.serotonin_params[3]
+        
+        # Ensure surprise is a tensor for comparison
+        if not torch.is_tensor(surprise):
+             surprise = torch.tensor(surprise, device=self.device)
+             
+        # High Stress Depletion
+        delta_deplete = deplet_rate * cortisol_new
+        serotonin_new = torch.where(cortisol_new > stress_thresh, serotonin - delta_deplete, serotonin)
+        
+        # Safety Recovery
+        delta_recover = recov_rate * (1.0 - cortisol_new)
+        mask_safety = (cortisol_new < safety_thresh) & (surprise < SURPRISE_SAFETY_THRESHOLD)
+        serotonin_new = torch.where(mask_safety, serotonin_new + delta_recover, serotonin_new)
             
         # --- Metabolic Constraint ---
         energy_factor = max(MIN_ENERGY_FACTOR, self.energy / MAX_ENERGY)

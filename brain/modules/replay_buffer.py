@@ -1,47 +1,28 @@
 """
-Prioritized Experience Replay Buffer
+Prioritized Experience Replay Buffer (Zero-Copy Optimization)
 
-Implements SumTree-based prioritized experience replay for efficient
-TD-error weighted sampling. High-error experiences are sampled more
-frequently to accelerate learning.
+Implements SumTree-based prioritized experience replay using pre-allocated
+Numpy arrays for maximum speed and memory efficiency.
 
 Reference: Schaul, T. et al. (2015). Prioritized Experience Replay
 """
 import torch
 import numpy as np
 import random
-from collections import namedtuple, deque
 
-
-# === REPLAY BUFFER CONSTANTS ===
-# These control the prioritized sampling behavior
-
-# Priority Exponent (α): Controls how much prioritization affects sampling
-# α = 0: Uniform sampling (no prioritization)
-# α = 1: Full prioritization based on TD-error
+# === CONSTANTS ===
 DEFAULT_PRIORITY_ALPHA = 0.6
-
-# Importance-Sampling Exponent (β): Corrects for non-uniform sampling bias
-# β = 0: No correction
-# β = 1: Full correction (should anneal to 1 during training)
 DEFAULT_IMPORTANCE_BETA = 0.4
-
-# Small constant to prevent zero priority
 PRIORITY_EPSILON = 0.01
-
-# Initial max priority for new experiences
 INITIAL_MAX_PRIORITY = 1.0
-
 
 class SumTree:
     """
-    SumTree data structure for Prioritized Experience Replay.
-    Leaf nodes store priorities. Internal nodes store sum of children.
+    SumTree for O(log N) priority updates and sampling.
     """
     def __init__(self, capacity):
         self.capacity = capacity
-        self.tree = np.zeros(2 * capacity - 1)
-        self.data = np.zeros(capacity, dtype=object)
+        self.tree = np.zeros(2 * capacity - 1, dtype=np.float32)
         self.write = 0
         self.n_entries = 0
 
@@ -66,11 +47,10 @@ class SumTree:
     def total(self):
         return self.tree[0]
 
-    def add(self, p, data):
+    def add(self, p):
         idx = self.write + self.capacity - 1
-        self.data[self.write] = data
         self.update(idx, p)
-
+        
         self.write += 1
         if self.write >= self.capacity:
             self.write = 0
@@ -86,76 +66,110 @@ class SumTree:
     def get(self, s):
         idx = self._retrieve(0, s)
         dataIdx = idx - self.capacity + 1
-        return (idx, self.tree[idx], self.data[dataIdx])
-
+        return (idx, self.tree[idx], dataIdx)
 
 class PrioritizedReplayBuffer:
     """
-    Prioritized Experience Replay Buffer.
-    Stores transitions (state, action, reward, next_state, done) with priorities.
+    Zero-Copy Prioritized Experience Replay Buffer.
+    Data is stored in contiguous Numpy arrays.
     """
     def __init__(self, capacity, alpha=DEFAULT_PRIORITY_ALPHA):
-        self.tree = SumTree(capacity)
         self.capacity = capacity
-        self.alpha = alpha  # Priority exponent
-        self.epsilon = PRIORITY_EPSILON  # Small constant to prevent zero priority
-        self.max_p = INITIAL_MAX_PRIORITY  # Track max priority in O(1)
+        self.alpha = alpha
+        self.epsilon = PRIORITY_EPSILON
+        self.max_p = INITIAL_MAX_PRIORITY
+        self.tree = SumTree(capacity)
+        
+        # Pre-allocated arrays (Initialized on first add)
+        self.states = None
+        self.actions = None
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.next_states = None
+        self.dones = np.zeros(capacity, dtype=np.float32)
+        
+        self.pos = 0
+
+    def _init_storage(self, state_shape, action_shape):
+        print(f"ReplayBuffer: Allocating storage for State:{state_shape}, Action:{action_shape}")
+        self.states = np.zeros((self.capacity, *state_shape), dtype=np.float32)
+        self.next_states = np.zeros((self.capacity, *state_shape), dtype=np.float32)
+        
+        # Handle scalar vs vector actions
+        if action_shape == ():
+            self.actions = np.zeros(self.capacity, dtype=np.int64) # Discrete scalar
+        else:
+            self.actions = np.zeros((self.capacity, *action_shape), dtype=np.float32) # Continuous/Multi-dim
 
     def add(self, state, action, reward, next_state, done):
-        """Add a new experience to memory."""
-        # Convert to numpy if needed
+        # Convert tensors to numpy
         if torch.is_tensor(state): state = state.detach().cpu().numpy()
         if torch.is_tensor(next_state): next_state = next_state.detach().cpu().numpy()
+        if torch.is_tensor(action): action = action.detach().cpu().numpy()
+        if torch.is_tensor(reward): reward = reward.item()
         
-        # O(1) max priority tracking
-        experience = [state, action, reward, next_state, done]
-        self.tree.add(self.max_p, experience)
+        # Initialize storage on first run
+        if self.states is None:
+            self._init_storage(state.shape, action.shape)
+            
+        # Store in arrays
+        self.states[self.pos] = state
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.next_states[self.pos] = next_state
+        self.dones[self.pos] = float(done)
+        
+        # Update Tree
+        self.tree.add(self.max_p)
+        
+        # Update pointer
+        self.pos = (self.pos + 1) % self.capacity
 
     def store(self, state, action, reward):
-        """
-        Simplified store for backward compatibility.
-        Assumes next_state is same as state and done=False.
-        """
+        """Legacy compatibility."""
         self.add(state, action, reward, state, False)
 
     def update_last_reward(self, reward):
-        """
-        Updates the reward of the most recently added experience.
-        Useful for delayed rewards in school scripts.
-        """
-        last_idx = (self.tree.write - 1) % self.capacity
-        if self.tree.data[last_idx] is not None:
-            # self.tree.data[last_idx] is a list [state, action, reward, next_state, done]
-            self.tree.data[last_idx][2] = reward
+        """Updates the reward of the most recently added experience."""
+        last_idx = (self.pos - 1) % self.capacity
+        self.rewards[last_idx] = reward
 
     def sample(self, batch_size, beta=0.4):
-        """
-        Sample a batch of experiences.
-        beta: Importance-sampling weight (annealed to 1.0).
-        """
-        batch = []
+        if self.tree.n_entries < batch_size:
+            return None
+            
         idxs = []
-        segment = self.tree.total() / batch_size
         priorities = []
-
+        data_idxs = []
+        
+        segment = self.tree.total() / batch_size
+        
         for i in range(batch_size):
             a = segment * i
             b = segment * (i + 1)
             s = random.uniform(a, b)
             
-            (idx, p, data) = self.tree.get(s)
-            batch.append(data)
+            (idx, p, data_idx) = self.tree.get(s)
             idxs.append(idx)
             priorities.append(p)
-
+            data_idxs.append(data_idx)
+            
+        # Vectorized Retrieval
+        b_states = self.states[data_idxs]
+        b_actions = self.actions[data_idxs]
+        b_rewards = self.rewards[data_idxs]
+        b_next_states = self.next_states[data_idxs]
+        b_dones = self.dones[data_idxs]
+        
+        # Calculate Weights
         sampling_probabilities = np.array(priorities) / self.tree.total()
         is_weight = np.power(self.tree.n_entries * sampling_probabilities, -beta)
         is_weight /= is_weight.max()
-
+        
+        # Return as tuple of Numpy arrays (Caller handles Tensor conversion)
+        batch = (b_states, b_actions, b_rewards, b_next_states, b_dones)
         return batch, idxs, is_weight
 
     def update_priorities(self, idxs, errors):
-        """Update priorities based on TD-errors."""
         for idx, error in zip(idxs, errors):
             p = (np.abs(error) + self.epsilon) ** self.alpha
             self.max_p = max(self.max_p, p)

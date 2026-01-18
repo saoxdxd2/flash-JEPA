@@ -43,7 +43,7 @@ LEGACY_SYSTEM_1_THRESHOLD = 0.8
 LEGACY_SURPRISE_THRESHOLD = 0.2
 
 
-class NeuralBasalGanglia(nn.Module):
+class BasalGanglia(nn.Module):
     """
     Neural Basal Ganglia with Go/NoGo Pathways.
     
@@ -196,7 +196,13 @@ class NeuralBasalGanglia(nn.Module):
             (confidence.item() * SYSTEM_1_CONFIDENCE_REDUCTION)
         )
         
-        if flash_actions is not None and flash_confidence > system_1_threshold and surprise < SURPRISE_THRESHOLD_FOR_SYSTEM1:
+        # Ensure surprise is a scalar or tensor
+        if torch.is_tensor(surprise):
+            surprise_val = surprise.mean().item()
+        else:
+            surprise_val = surprise
+            
+        if flash_actions is not None and flash_confidence > system_1_threshold and surprise_val < SURPRISE_THRESHOLD_FOR_SYSTEM1:
             used_system = 1
             output_logits = flash_actions if flash_actions.dim() > 1 else flash_actions.unsqueeze(0)
         else:
@@ -292,65 +298,3 @@ class NeuralBasalGanglia(nn.Module):
         if self.go_trace is None or self.nogo_trace is None:
             return 0.0
         return (self.go_trace.mean() - self.nogo_trace.mean()).item()
-
-
-# === LEGACY WRAPPER ===
-# Keep backward compatibility with existing code
-class BasalGanglia:
-    """
-    Legacy wrapper for backward compatibility.
-    Delegates to NeuralBasalGanglia when available.
-    """
-    def __init__(self, action_size, state_size=None):
-        self.action_size = action_size
-        self._neural_bg = None
-        self._state_size = state_size
-        
-    def _ensure_neural(self, state_size):
-        """Lazy initialization of neural BG."""
-        if self._neural_bg is None:
-            self._neural_bg = NeuralBasalGanglia(state_size, self.action_size)
-            
-    def gate_action(self, action_logits, dopamine, flash_info=None, surprise=0.0, greedy=False):
-        """
-        Legacy interface - falls back to simple gating if neural BG not initialized.
-        """
-        if self._neural_bg is not None:
-            # Use neural pathway (requires state input)
-            # But legacy interface doesn't provide state, so we fall back
-            pass
-            
-        # Original simple gating logic
-        flash_actions, flash_confidence = None, 0.0
-        if flash_info is not None:
-            flash_actions, flash_confidence = flash_info
-            if hasattr(flash_confidence, 'item'):
-                flash_confidence = flash_confidence.item()
-
-        system_1_threshold = LEGACY_SYSTEM_1_THRESHOLD - (dopamine * SYSTEM_1_DOPAMINE_REDUCTION)
-        
-        if flash_actions is not None and flash_confidence > system_1_threshold and surprise < LEGACY_SURPRISE_THRESHOLD:
-            final_logits = flash_actions
-            used_system = 1
-        else:
-            final_logits = action_logits
-            used_system = 2
-
-        if hasattr(final_logits, 'detach'):
-            final_logits = final_logits.detach().cpu().numpy()
-        
-        if final_logits.ndim > 1:
-            final_logits = final_logits.flatten()
-            
-        if greedy:
-            return np.argmax(final_logits), used_system
-            
-        temperature = max(TEMPERATURE_MIN, 1.0 - dopamine)
-        exp_logits = np.exp((final_logits - np.max(final_logits)) / temperature)
-        probs = exp_logits / np.sum(exp_logits)
-        
-        if np.isnan(probs).any():
-            probs = np.ones(self.action_size) / self.action_size
-            
-        action = np.random.choice(self.action_size, p=probs)
-        return action, used_system

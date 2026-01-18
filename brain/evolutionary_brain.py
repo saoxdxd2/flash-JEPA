@@ -11,12 +11,11 @@ from brain.modules.broca import BrocaModule
 from brain.modules.biology_core import NeurotransmitterSystem
 from brain.modules.amygdala import Amygdala
 from brain.modules.basal_ganglia import BasalGanglia
-from brain.utils import ResourceMonitor, get_best_device, get_memory_stats, check_ram_limit
+from brain.utils import ResourceMonitor, get_best_device, get_memory_stats, check_ram_limit, ONNXEngine
 from brain.modules.neural_memory import TitansMemory
 from models.ecg import ModularBrain
 from brain.modules.replay_buffer import PrioritizedReplayBuffer
 from brain.modules.cradle import Cradle
-from brain.modules.onnx_engine import ONNXEngine
 
 class EvolutionaryBrain:
     """
@@ -47,10 +46,11 @@ class EvolutionaryBrain:
         
         # --- Biological Core ---
         self.chemistry = NeurotransmitterSystem(genome=self.genome)
-        self.amygdala = Amygdala(genome=self.genome)
+        self.amygdala = Amygdala(genome=self.genome, device=self.device)
         # Distributed Motor Cortex: Basal Ganglia only selects the INTENT (0-9)
         self.intent_size = 10
-        self.basal_ganglia = BasalGanglia(self.intent_size)
+        # Pass input_size as state_size for Basal Ganglia
+        self.basal_ganglia = BasalGanglia(self.input_size, self.intent_size).to(self.device)
         
         # --- Replay Buffer (Unified System 1/2) ---
         self.replay_buffer = PrioritizedReplayBuffer(capacity=self.genome.REPLAY_BUFFER_CAPACITY)
@@ -137,119 +137,80 @@ class EvolutionaryBrain:
             self.trm.reset_state()
 
     def decide(self, full_input_tensor, train_internal_rl=True, greedy=False, disable_reflex=False):
+        # 1. Input Processing & Conscious Masking
+        if full_input_tensor.dim() == 1: full_input_tensor = full_input_tensor.unsqueeze(0)
+        
         L = self.latent_dim
-        if full_input_tensor.dim() == 1:
-            full_input_tensor = full_input_tensor.unsqueeze(0)
-            
         boosted_input = full_input_tensor.clone()
         boosted_input[:, :3*L] *= self.genome.INPUT_BOOST_FACTOR
         
-        # --- CONSCIOUS/UNCONSCIOUS SEPARATION ---
-        # Hide the raw biological state from the "Conscious" input stream.
-        # The Conscious mind (Concept/Strategy) sees the World, not the Machinery.
-        # The Unconscious (Reflex/Thalamus) sees the Machinery via the 'chemicals' channel.
+        # Mask Biological State from Conscious Stream (Indices [6*L : 6*L + 8])
+        boosted_input[:, 6*L : 6*L + 8] = 0.0
         
-        # Bio-state is at indices [6*L : 6*L + 8] (approx, depending on implementation)
-        # We zero it out in the main vector so it doesn't get encoded into the conscious stream.
-        bio_start = 6 * L
-        bio_end = bio_start + 8 # Dopamine, Serotonin, Norepinephrine, Stamina, Surprise, TextDensity, RAM, CPU
-        boosted_input[:, bio_start:bio_end] = 0.0
+        chemicals = self.chemistry.get_state_vector() # [1, 4] Tensor
         
-        chemicals = torch.tensor([
-            self.chemistry.dopamine,
-            self.chemistry.serotonin,
-            self.chemistry.norepinephrine,
-            self.chemistry.cortisol
-        ], device=boosted_input.device).unsqueeze(0)
+        # 2. Forward Pass (Hybrid ONNX/PyTorch)
+        use_onnx = self.use_onnx and self.onnx_engine is not None
         
-        # 2. Forward Pass
-        if self.use_onnx and self.onnx_engine is not None:
-            # ONNX Inference (Reflex Path)
-            if self.onnx_states is None:
-                self._init_onnx_states()
-            
-            onnx_inputs = {
+        if use_onnx:
+            if self.onnx_states is None: self._init_onnx_states()
+            outputs = self.onnx_engine.run({
                 'input': boosted_input.cpu().numpy(),
-                'chemicals': chemicals.cpu().numpy()
-            }
-            for i, name in enumerate(self.onnx_engine.session.get_inputs()[2:]):
-                onnx_inputs[name.name] = self.onnx_states[i]
-            
-            outputs = self.onnx_engine.run(onnx_inputs)
-            logits_np = outputs[0]
-            params_np = outputs[1]
-            confidence_np = outputs[2]
+                'chemicals': chemicals.cpu().numpy(),
+                **{name.name: state for name, state in zip(self.onnx_engine.session.get_inputs()[2:], self.onnx_states)}
+            })
+            logits_np, params_np, conf_np = outputs[:3]
             self.onnx_states = outputs[3:]
             
-            confidence = torch.from_numpy(confidence_np).to(self.device)
+            confidence = torch.from_numpy(conf_np).to(self.device)
             
-            # Hybrid Switching: If confidence is low, fallback to System 2 (PyTorch)
+            # Fallback to System 2 if confidence is low
             if confidence.mean().item() < self.genome.CONFIDENCE_THRESHOLD:
-                # Extract Memory Input for Thalamic Gating
-                # Structure: [Foveal(L), Peripheral(L), Semantic(L), Memory(3L), Bio...]
-                L = self.latent_dim
-                memory_input = boosted_input[:, 3*L : 6*L]
-                
-                res = self.trm.forward(boosted_input, chemicals=chemicals, train_internal_rl=train_internal_rl, memory_input=memory_input)
-                logits, value, energy, flash_info = res
+                use_onnx = False # Trigger PyTorch path
             else:
                 logits = torch.from_numpy(logits_np).to(self.device)
                 value = torch.from_numpy(params_np).to(self.device)
-                energy = torch.tensor(0.0, device=self.device) # Placeholder
-                # Provide dummy flash_info for Basal Ganglia
-                # (flash_actions, confidence, p_reflex, p_concept, p_strategy, next_h_reflex, next_h_concept, next_h_strategy)
-                dummy_flash = (logits, confidence, None, None, None, None, None, None)
-                flash_info = dummy_flash
-        else:
-            # Extract Memory Input for Thalamic Gating
-            L = self.latent_dim
-            memory_input = boosted_input[:, 3*L : 6*L]
-            
-            res = self.trm.forward(boosted_input, chemicals=chemicals, train_internal_rl=train_internal_rl, memory_input=memory_input)
+                energy = torch.tensor(0.0, device=self.device)
+                flash_info = (logits, confidence, None, None, None, None, None, None)
+
+        if not use_onnx:
+            # PyTorch Forward Pass (Thalamic Gating enabled via memory_input)
+            res = self.trm.forward(
+                boosted_input, 
+                chemicals=chemicals, 
+                train_internal_rl=train_internal_rl, 
+                memory_input=boosted_input[:, 3*L : 6*L]
+            )
             logits, value, energy, flash_info = res
+            
         self.last_value = value.mean().item() if torch.is_tensor(value) else value
-        
         surprise = getattr(self, 'last_surprise', 0.0)
         
-        # --- 4. Amygdala Hijack Check ---
-        # Immediate threat response (Overrides Cortex)
-        hijack, reflex_action = self.amygdala.process(
-            surprise, 
-            0.0, # Pain (Placeholder)
-            self.chemistry.get_state_vector()
-        )
-        
-        if hijack and not disable_reflex:
-            self.last_used_system = 0 # 0 for Amygdala
-            # Create a one-hot or similar logit vector for the reflex action
-            reflex_logits = torch.zeros_like(logits)
-            reflex_logits[0, reflex_action] = 10.0
-            return reflex_action, reflex_logits
+        # 3. Amygdala Hijack (Immediate Threat)
+        if not disable_reflex:
+            surprise_t = torch.tensor(surprise, device=self.device) if not torch.is_tensor(surprise) else surprise
+            hijack_mask, reflex_actions = self.amygdala.process(surprise_t, torch.tensor(0.0, device=self.device), chemicals)
             
-        # --- 5. Basal Ganglia Gating (System 1 vs 2) ---
-        # Distributed Motor Control:
-        # Logits [0:10] = Intent (Move, Click, Type...)
-        # Logits [10:]  = Parameters (X, Y, Char...)
-        
-        intent_logits = logits[:, :self.intent_size]
-        param_logits = logits[:, self.intent_size:]
-        
-        # Flash Info also needs to be split if it exists
-        flash_intent = None
-        if flash_info[0] is not None:
-            flash_intent = flash_info[0][:, :self.intent_size]
-            
-        intent_action, used_system = self.basal_ganglia.gate_action(
-            intent_logits, 
-            self.chemistry.dopamine, 
-            flash_info=(flash_intent, flash_info[1]), 
+            if hijack_mask.any():
+                self.last_used_system = 0
+                reflex_action = reflex_actions[0].item()
+                reflex_logits = torch.zeros_like(logits)
+                reflex_logits[0, reflex_action] = 10.0
+                return reflex_action, reflex_logits
+
+        # 4. Basal Ganglia Gating (Intent Selection)
+        intent_action, meta = self.basal_ganglia(
+            state=boosted_input,
+            action_logits=logits[:, :self.intent_size],
+            dopamine=self.chemistry.dopamine,
+            flash_info=(flash_info[0][:, :self.intent_size] if flash_info[0] is not None else None, flash_info[1]),
             surprise=surprise,
+            chemicals=chemicals,
             greedy=greedy
         )
         
-        self.last_used_system = used_system
-        # Return Intent Index AND Parameter Logits
-        return intent_action, param_logits
+        self.last_used_system = meta['used_system']
+        return intent_action, logits[:, self.intent_size:]
 
     def train_step(self, batch_size=32, distillation=False):
         if len(self.replay_buffer) < batch_size:
@@ -260,13 +221,20 @@ class EvolutionaryBrain:
             self.trm.detach_state()
             
         batch_size = int(batch_size)
+        
+        # Sample Batch (Zero-Copy Numpy Arrays)
         batch_data, indices, weights = self.replay_buffer.sample(batch_size)
-        states = torch.tensor(np.array([x[0] for x in batch_data]), dtype=torch.float32)
-        actions = torch.tensor(np.array([x[1] for x in batch_data]), dtype=torch.long)
-        rewards = torch.tensor(np.array([x[2] for x in batch_data]), dtype=torch.float32)
-        next_states = torch.tensor(np.array([x[3] for x in batch_data]), dtype=torch.float32)
-        dones = torch.tensor(np.array([x[4] for x in batch_data]), dtype=torch.float32)
-        weights = torch.tensor(weights, dtype=torch.float32)
+        if batch_data is None: return 0.0
+        
+        b_states, b_actions, b_rewards, b_next_states, b_dones = batch_data
+        
+        # Convert to Tensors (Zero-Copy where possible)
+        states = torch.from_numpy(b_states).float().to(self.device)
+        actions = torch.from_numpy(b_actions).long().to(self.device)
+        rewards = torch.from_numpy(b_rewards).float().to(self.device)
+        next_states = torch.from_numpy(b_next_states).float().to(self.device)
+        dones = torch.from_numpy(b_dones).float().to(self.device)
+        weights = torch.from_numpy(weights).float().to(self.device)
         
         mask = rewards.abs() > 0.01
         if mask.any():

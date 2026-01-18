@@ -217,9 +217,82 @@ class SparseLinear(nn.Module):
         self.register_buffer('activity_in', torch.zeros(in_features, device=self.indices.device), persistent=False)
         self.register_buffer('activity_out', torch.zeros(out_features, device=self.indices.device), persistent=False)
 
+class HierarchicalBlock(nn.Module):
+    """
+    Encapsulates a single level of the hierarchy (Sensory, Recurrent, Predictor, Router).
+    """
+    def __init__(self, in_size, hidden_size, tau_range, router_blocks=64):
+        super().__init__()
+        self.in_size = in_size
+        self.hidden_size = hidden_size
+        self.router_blocks = router_blocks
+        
+        self.W = SparseLinear(in_size, hidden_size)
+        self.R = SparseLinear(hidden_size, hidden_size)
+        self.P = SparseLinear(hidden_size, hidden_size)
+        
+        self.router = nn.Linear(in_size, router_blocks)
+        
+        # Time constants
+        min_tau, max_tau = tau_range
+        self.tau = nn.Parameter(torch.rand(hidden_size) * (max_tau - min_tau) + min_tau)
+        
+    def forward(self, x, h_prev, gate, dt=0.1):
+        # Router
+        r_gate = torch.sigmoid(self.router(x))
+        mask = r_gate.repeat_interleave(64, dim=1)[:, :self.hidden_size]
+        
+        # Dynamics
+        sensory = self.W(x) * mask
+        rec = self.R(h_prev)
+        target = torch.tanh(sensory + rec)
+        
+        # Leaky Update
+        h_new = h_prev + gate * (target - h_prev) * (dt / self.tau)
+        
+        # Prediction
+        pred = self.P(h_new)
+        
+        return h_new, pred
+        
+    def forward_onnx(self, x, h_prev, gate, dt=0.1):
+        # Router
+        r_gate = torch.sigmoid(self.router(x))
+        mask = r_gate.repeat_interleave(64, dim=1)[:, :self.hidden_size]
+        
+        # Dynamics (Dense for ONNX)
+        sensory = self.W.forward_onnx(x) * mask
+        rec = self.R.forward_onnx(h_prev)
+        target = torch.tanh(sensory + rec)
+        
+        h_new = h_prev + gate * (target - h_prev) * (dt / self.tau)
+        pred = self.P.forward_onnx(h_new)
+        
+        return h_new, pred
+
+    def resize(self, in_size=None, hidden_size=None):
+        if in_size is not None: self.in_size = in_size
+        if hidden_size is not None: self.hidden_size = hidden_size
+        
+        self.W.resize(in_features=self.in_size, out_features=self.hidden_size)
+        self.R.resize(in_features=self.hidden_size, out_features=self.hidden_size)
+        self.P.resize(in_features=self.hidden_size, out_features=self.hidden_size)
+        
+        device = self.tau.device
+        if len(self.tau) != self.hidden_size:
+            # Resize Tau (Random re-init for simplicity on resize, or preserve?)
+            # Preserving is better but complex. For now, re-init consistent with constructor.
+            # Assuming resize happens rarely and mostly during growth.
+            self.tau = nn.Parameter(torch.rand(self.hidden_size, device=device) * 0.1 + 0.01) # Default range, should pass in range
+            
+        if self.router.in_features != self.in_size:
+            self.router = nn.Linear(self.in_size, self.router_blocks).to(device)
+
+
 class NeuromodulatedHolographicBrain(nn.Module):
     """
     Hybrid H-NH-JEPA Architecture.
+    Refactored for conciseness using HierarchicalBlock.
     """
     def __init__(self, input_size, hidden_size, output_size, genome=None, memory_size=None, **kwargs):
         super().__init__()
@@ -239,14 +312,9 @@ class NeuromodulatedHolographicBrain(nn.Module):
         self.encoded_size = 32 * 2 * 2 * 2 # 256
         self.input_projection = nn.Linear(input_size, self.base_res**3)
         
-        # --- 1.5 Thalamic Gate (Structural Infinite Regression) ---
+        # --- 1.5 Thalamic Gate ---
         if self.memory_size is not None and self.memory_size > 0:
-            # Projects memory (e.g. 768) to encoded space (256)
             self.memory_projection = nn.Linear(self.memory_size, self.encoded_size)
-            
-            # Gating Controller: Decides mixing ratio based on Chemicals + Signal Strength
-            # Input: Encoded Sensory (256) + Projected Memory (256) + Chemicals (4)
-            # Output: 1 scalar (Alpha: 0=Memory, 1=Sensory)
             self.thalamus_gate = nn.Sequential(
                 nn.Linear(self.encoded_size * 2 + 4, 32),
                 nn.Tanh(),
@@ -262,43 +330,22 @@ class NeuromodulatedHolographicBrain(nn.Module):
         s_size = hidden_size // 4
         c_size = hidden_size - (r_size + s_size)
         
-        # --- 3. Sparse Hierarchical Core ---
-        self.W_reflex = SparseLinear(self.encoded_size, r_size)
-        self.R_reflex = SparseLinear(r_size, r_size)
+        # --- 3. Hierarchical Blocks ---
+        self.reflex = HierarchicalBlock(self.encoded_size, r_size, TAU_REFLEX_RANGE)
+        self.concept = HierarchicalBlock(r_size, c_size, TAU_CONCEPT_RANGE)
+        self.strategy = HierarchicalBlock(c_size, s_size, TAU_STRATEGY_RANGE)
         
-        self.W_concept = SparseLinear(r_size, c_size)
-        self.R_concept = SparseLinear(c_size, c_size)
-        
-        self.W_strategy = SparseLinear(c_size, s_size)
-        self.R_strategy = SparseLinear(s_size, s_size)
-        
-        # --- 4. Latent Predictors (JEPA) ---
-        self.P_reflex = SparseLinear(r_size, r_size)
-        self.P_concept = SparseLinear(c_size, c_size)
-        self.P_strategy = SparseLinear(s_size, s_size)
-        
-        # --- 5. Neuromodulated Gating ---
+        # --- 4. Neuromodulated Gating ---
         self.meta_controller = nn.Sequential(
             nn.Linear(self.encoded_size + 4, 64),
             nn.Tanh(),
             nn.Linear(64, 3) 
         )
         
-        # --- 6. Sparse MoE Routers ---
-        self.router_reflex = nn.Linear(self.encoded_size, 64)
-        self.router_concept = nn.Linear(r_size, 64)
-        self.router_strategy = nn.Linear(c_size, 64)
-        
-        # --- 6. Temporal Dynamics ---
-        self.tau_reflex = nn.Parameter(torch.rand(r_size) * 0.1 + 0.01)
-        self.tau_concept = nn.Parameter(torch.rand(c_size) * 0.4 + 0.1)
-        self.tau_strategy = nn.Parameter(torch.rand(s_size) * 9.0 + 1.0)
-        
-        # --- 7. Flash Head (System 1) ---
+        # --- 5. Heads ---
         self.flash_head = nn.Linear(r_size, output_size)
         self.flash_confidence = nn.Linear(r_size, 1)
         
-        # --- 8. Selective Decoder (System 2) ---
         self.decoder = nn.Linear(hidden_size, output_size)
         self.intent_gate = nn.Linear(hidden_size, 1)
         self.critic = nn.Linear(hidden_size, 1)
@@ -312,36 +359,31 @@ class NeuromodulatedHolographicBrain(nn.Module):
         
     def _init_routing_specialization(self):
         with torch.no_grad():
-            for name, module in self.named_modules():
-                if isinstance(module, SparseLinear):
-                    num_blocks = module.out_features // 64
-                    if num_blocks > 0:
-                        for b in range(num_blocks):
-                            mask = (module.indices[1] >= b*64) & (module.indices[1] < (b+1)*64)
-                            module.values.data[mask] += torch.randn(mask.sum()) * 0.01 * (b / num_blocks)
+            for module in [self.reflex.W, self.concept.W, self.strategy.W]:
+                num_blocks = module.out_features // 64
+                if num_blocks > 0:
+                    for b in range(num_blocks):
+                        mask = (module.indices[1] >= b*64) & (module.indices[1] < (b+1)*64)
+                        module.values.data[mask] += torch.randn(mask.sum()) * 0.01 * (b / num_blocks)
         
     def forward(self, input_vector, dt=0.1, reward=0.0, chemicals=None, train_internal_rl=True, memory_input=None):
         input_vector = input_vector.float()
-        if chemicals is not None:
-            chemicals = chemicals.float()
-        if memory_input is not None:
-            memory_input = memory_input.float()
-        if input_vector.dim() == 1:
-            input_vector = input_vector.unsqueeze(0)
+        if chemicals is not None: chemicals = chemicals.float()
+        if memory_input is not None: memory_input = memory_input.float()
+        if input_vector.dim() == 1: input_vector = input_vector.unsqueeze(0)
         batch_size = input_vector.shape[0]
         
-        # Derive sizes directly from parameters (Static Shape Philosophy)
-        r_size = self.W_reflex.out_features
-        c_size = self.W_concept.out_features
-        s_size = self.W_strategy.out_features
+        if chemicals is not None:
+            if chemicals.dim() == 1:
+                chemicals = chemicals.unsqueeze(0)
+            if chemicals.shape[0] != batch_size:
+                chemicals = chemicals.repeat(batch_size, 1)
         
         # Init States
-        if self.h_reflex is None or self.h_reflex.shape[0] != batch_size or self.h_reflex.shape[1] != r_size:
-            self.h_reflex = torch.zeros(batch_size, r_size, device=input_vector.device)
-        if self.h_concept is None or self.h_concept.shape[0] != batch_size or self.h_concept.shape[1] != c_size:
-            self.h_concept = torch.zeros(batch_size, c_size, device=input_vector.device)
-        if self.h_strategy is None or self.h_strategy.shape[0] != batch_size or self.h_strategy.shape[1] != s_size:
-            self.h_strategy = torch.zeros(batch_size, s_size, device=input_vector.device)
+        if self.h_reflex is None or self.h_reflex.shape[0] != batch_size:
+            self.h_reflex = torch.zeros(batch_size, self.reflex.hidden_size, device=input_vector.device)
+            self.h_concept = torch.zeros(batch_size, self.concept.hidden_size, device=input_vector.device)
+            self.h_strategy = torch.zeros(batch_size, self.strategy.hidden_size, device=input_vector.device)
             
         # --- 1. Holographic Encoding ---
         x = self.input_projection(input_vector).view(batch_size, 1, self.base_res, self.base_res, self.base_res)
@@ -353,34 +395,16 @@ class NeuromodulatedHolographicBrain(nn.Module):
         # --- 1.5 Thalamic Gating ---
         if self.thalamus_gate is not None and memory_input is not None:
             if memory_input.dim() == 1: memory_input = memory_input.unsqueeze(0)
-            
-            # Project Memory to Encoded Space
             encoded_memory = self.memory_projection(memory_input)
             
-            # Default chemicals if missing
-            if chemicals is None:
-                chem_vec = torch.tensor([0.5, 0.5, 0.2, 0.0], device=input_vector.device).repeat(batch_size, 1)
-            else:
-                chem_vec = chemicals
-                
-            # Calculate Gate Alpha
-            # We want Alpha to be high when Norepinephrine (Arousal) is high
-            # We want Alpha to be low when Serotonin is high (Sleep)
-            # The network learns this mapping, but we can bias it or let it emerge.
-            # For now, we let the network learn the optimal mixing based on the state.
+            chem_vec = chemicals if chemicals is not None else torch.tensor([0.5, 0.5, 0.2, 0.0], device=input_vector.device).repeat(batch_size, 1)
+            
             gate_input = torch.cat([encoded_input, encoded_memory, chem_vec], dim=1)
             alpha = self.thalamus_gate(gate_input)
             
-            # Apply Mixing
-            # Reality (encoded_input) vs Dream (encoded_memory)
-            # Note: During silence, encoded_input might be zeros or noise.
-            # If Alpha is 0, we fully hallucinate.
             encoded_input = (alpha * encoded_input) + ((1.0 - alpha) * encoded_memory)
-            
-            # Add Thalamic Noise (Stochastic Resonance)
             if self.training:
-                noise = torch.randn_like(encoded_input) * 0.01
-                encoded_input = encoded_input + noise
+                encoded_input += torch.randn_like(encoded_input) * 0.01
         
         # --- 2. Neuromodulated Gating ---
         if chemicals is None:
@@ -390,49 +414,22 @@ class NeuromodulatedHolographicBrain(nn.Module):
         gates = torch.sigmoid(self.meta_controller(meta_input))
         g_reflex, g_concept, g_strategy = torch.chunk(gates, 3, dim=1)
         
-        # --- 3. Hierarchical Update (Sparse) ---
-        # Level 1: Reflex
-        r_reflex_gate = torch.sigmoid(self.router_reflex(encoded_input))
-        reflex_mask = r_reflex_gate.repeat_interleave(64, dim=1)[:, :r_size]
-        
-        sensory_reflex = self.W_reflex(encoded_input) * reflex_mask
-        rec_reflex = self.R_reflex(self.h_reflex)
-        target_reflex = torch.tanh(sensory_reflex + rec_reflex)
-        self.h_reflex = self.h_reflex + g_reflex * (target_reflex - self.h_reflex) * (dt / self.tau_reflex)
+        # --- 3. Hierarchical Update ---
+        self.h_reflex, p_reflex = self.reflex(encoded_input, self.h_reflex, g_reflex, dt)
         
         # Flash Head
         flash_actions = self.flash_head(self.h_reflex)
         confidence = torch.sigmoid(self.flash_confidence(self.h_reflex))
         
-        # Level 2: Concept
-        r_concept_gate = torch.sigmoid(self.router_concept(self.h_reflex))
-        concept_mask = r_concept_gate.repeat_interleave(64, dim=1)[:, :c_size]
-        
-        sensory_concept = self.W_concept(self.h_reflex) * concept_mask
-        rec_concept = self.R_concept(self.h_concept)
-        target_concept = torch.tanh(sensory_concept + rec_concept)
-        self.h_concept = self.h_concept + g_concept * (target_concept - self.h_concept) * (dt / self.tau_concept)
-        
-        # Level 3: Strategy
-        r_strategy_gate = torch.sigmoid(self.router_strategy(self.h_concept))
-        strategy_mask = r_strategy_gate.repeat_interleave(64, dim=1)[:, :s_size]
-        
-        sensory_strategy = self.W_strategy(self.h_concept) * strategy_mask
-        rec_strategy = self.R_strategy(self.h_strategy)
-        target_strategy = torch.tanh(sensory_strategy + rec_strategy)
-        self.h_strategy = self.h_strategy + g_strategy * (target_strategy - self.h_strategy) * (dt / self.tau_strategy)
+        self.h_concept, p_concept = self.concept(self.h_reflex, self.h_concept, g_concept, dt)
+        self.h_strategy, p_strategy = self.strategy(self.h_concept, self.h_strategy, g_strategy, dt)
         
         # Stability: Clip hidden states
         self.h_reflex = torch.clamp(self.h_reflex, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
         self.h_concept = torch.clamp(self.h_concept, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
         self.h_strategy = torch.clamp(self.h_strategy, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
         
-        # --- 6. Latent Prediction (JEPA) ---
-        p_reflex = self.P_reflex(self.h_reflex)
-        p_concept = self.P_concept(self.h_concept)
-        p_strategy = self.P_strategy(self.h_strategy)
-        
-        # --- 7. Selective Decoding ---
+        # --- 4. Decoding ---
         full_h = torch.cat([self.h_reflex, self.h_concept, self.h_strategy], dim=1)
         actions = self.decoder(full_h)
         value = self.critic(full_h)
@@ -442,13 +439,7 @@ class NeuromodulatedHolographicBrain(nn.Module):
         return actions, value, energy, flash_data
 
     def forward_onnx(self, input_vector, chemicals, h_reflex, h_concept, h_strategy, dt=0.1):
-        """
-        ONNX-friendly forward pass. Stateless and uses dense operations.
-        """
         batch_size = input_vector.shape[0]
-        r_size = self.W_reflex.out_features
-        c_size = self.W_concept.out_features
-        s_size = self.W_strategy.out_features
 
         # --- 1. Holographic Encoding ---
         x = self.input_projection(input_vector).view(batch_size, 1, self.base_res, self.base_res, self.base_res)
@@ -466,43 +457,15 @@ class NeuromodulatedHolographicBrain(nn.Module):
         g_reflex, g_concept, g_strategy = torch.chunk(gates, 3, dim=1)
         
         # --- 3. Hierarchical Update ---
-        # Level 1: Reflex
-        r_reflex_gate = torch.sigmoid(self.router_reflex(encoded_input))
-        reflex_mask = r_reflex_gate.repeat_interleave(64, dim=1)[:, :r_size]
+        next_h_reflex, p_reflex = self.reflex.forward_onnx(encoded_input, h_reflex, g_reflex, dt)
         
-        sensory_reflex = self.W_reflex.forward_onnx(encoded_input) * reflex_mask
-        rec_reflex = self.R_reflex.forward_onnx(h_reflex)
-        target_reflex = torch.tanh(sensory_reflex + rec_reflex)
-        next_h_reflex = h_reflex + g_reflex * (target_reflex - h_reflex) * (dt / self.tau_reflex)
-        
-        # Flash Head
         flash_actions = self.flash_head(next_h_reflex)
         confidence = torch.sigmoid(self.flash_confidence(next_h_reflex))
         
-        # Level 2: Concept
-        r_concept_gate = torch.sigmoid(self.router_concept(next_h_reflex))
-        concept_mask = r_concept_gate.repeat_interleave(64, dim=1)[:, :c_size]
+        next_h_concept, p_concept = self.concept.forward_onnx(next_h_reflex, h_concept, g_concept, dt)
+        next_h_strategy, p_strategy = self.strategy.forward_onnx(next_h_concept, h_strategy, g_strategy, dt)
         
-        sensory_concept = self.W_concept.forward_onnx(next_h_reflex) * concept_mask
-        rec_concept = self.R_concept.forward_onnx(h_concept)
-        target_concept = torch.tanh(sensory_concept + rec_concept)
-        next_h_concept = h_concept + g_concept * (target_concept - h_concept) * (dt / self.tau_concept)
-        
-        # Level 3: Strategy
-        r_strategy_gate = torch.sigmoid(self.router_strategy(next_h_concept))
-        strategy_mask = r_strategy_gate.repeat_interleave(64, dim=1)[:, :s_size]
-        
-        sensory_strategy = self.W_strategy.forward_onnx(next_h_concept) * strategy_mask
-        rec_strategy = self.R_strategy.forward_onnx(h_strategy)
-        target_strategy = torch.tanh(sensory_strategy + rec_strategy)
-        next_h_strategy = h_strategy + g_strategy * (target_strategy - h_strategy) * (dt / self.tau_strategy)
-        
-        # --- 6. Latent Prediction (JEPA) ---
-        p_reflex = self.P_reflex.forward_onnx(next_h_reflex)
-        p_concept = self.P_concept.forward_onnx(next_h_concept)
-        p_strategy = self.P_strategy.forward_onnx(next_h_strategy)
-        
-        # --- 7. Selective Decoding ---
+        # --- 4. Decoding ---
         full_h = torch.cat([next_h_reflex, next_h_concept, next_h_strategy], dim=1)
         actions = self.decoder(full_h)
         value = self.critic(full_h)
@@ -528,27 +491,11 @@ class NeuromodulatedHolographicBrain(nn.Module):
         s_size = new_hidden_size // 4
         c_size = new_hidden_size - (r_size + s_size)
         
+        self.reflex.resize(hidden_size=r_size)
+        self.concept.resize(in_size=r_size, hidden_size=c_size)
+        self.strategy.resize(in_size=c_size, hidden_size=s_size)
+        
         device = next(self.parameters()).device
-        
-        self.W_reflex.resize(out_features=r_size)
-        self.R_reflex.resize(in_features=r_size, out_features=r_size)
-        self.W_concept.resize(in_features=r_size, out_features=c_size)
-        self.R_concept.resize(in_features=c_size, out_features=c_size)
-        self.W_strategy.resize(in_features=c_size, out_features=s_size)
-        self.R_strategy.resize(in_features=s_size, out_features=s_size)
-        
-        self.P_reflex.resize(in_features=r_size, out_features=r_size)
-        self.P_concept.resize(in_features=c_size, out_features=c_size)
-        self.P_strategy.resize(in_features=s_size, out_features=s_size)
-        
-        self.tau_reflex = nn.Parameter(torch.rand(r_size, device=device) * 0.1 + 0.01)
-        self.tau_concept = nn.Parameter(torch.rand(c_size, device=device) * 0.4 + 0.1)
-        self.tau_strategy = nn.Parameter(torch.rand(s_size, device=device) * 9.0 + 1.0)
-        
-        self.router_reflex = nn.Linear(self.encoded_size, 64).to(device)
-        self.router_concept = nn.Linear(r_size, 64).to(device)
-        self.router_strategy = nn.Linear(c_size, 64).to(device)
-        
         self.flash_head = nn.Linear(r_size, self.output_size).to(device)
         self.flash_confidence = nn.Linear(r_size, 1).to(device)
         self.decoder = nn.Linear(new_hidden_size, self.output_size).to(device)
@@ -561,52 +508,38 @@ class NeuromodulatedHolographicBrain(nn.Module):
         if new_input_size == self.input_size: return
         print(f"NeuromodulatedHolographicBrain: Resizing Input {self.input_size} -> {new_input_size}")
         self.input_size = new_input_size
-        self.input_projection = nn.Linear(new_input_size, self.base_res**3)
+        self.input_projection = nn.Linear(new_input_size, self.base_res**3).to(next(self.parameters()).device)
         self.reset_state()
 
     def learn_trajectory(self, input_sequence, target_h_sequence, lr=0.001):
-        """
-        Supervised State Imprinting (SSI) for NeuromodulatedHolographicBrain.
-        Trains the hierarchical states to match a teacher trajectory.
-        
-        input_sequence: [T, Batch, input_size]
-        target_h_sequence: [T, Batch, hidden_size]
-        """
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         total_loss = 0.0
         
-        # Derive sizes
-        r_size = self.W_reflex.out_features
-        s_size = self.W_strategy.out_features
-        c_size = self.W_concept.out_features
+        r_size = self.reflex.hidden_size
+        c_size = self.concept.hidden_size
+        s_size = self.strategy.hidden_size
         
         self.reset_state()
         for t in range(len(input_sequence)):
             optimizer.zero_grad()
             
-            # Forward pass (single step)
             actions, value, energy, flash_data = self.forward(input_sequence[t])
             flash, conf, p_r, p_c, p_s, _, _, _ = flash_data
             
-            # Combine current states
             current_h = torch.cat([self.h_reflex, self.h_concept, self.h_strategy], dim=1)
-            
-            # Target for this step
             target_h = target_h_sequence[t]
             
-            # Loss: Match the full hidden state
             loss = F.mse_loss(current_h, target_h)
             
-            # Also match JEPA predictions if possible (Self-Consistency)
             if t < len(target_h_sequence) - 1:
                 next_target = target_h_sequence[t+1]
                 t_r, t_c, t_s = torch.split(next_target, [r_size, c_size, s_size], dim=1)
-            loss += SSI_JEPA_CONSISTENCY_WEIGHT * (F.mse_loss(p_r, t_r) + F.mse_loss(p_c, t_c) + F.mse_loss(p_s, t_s))
+                loss += SSI_JEPA_CONSISTENCY_WEIGHT * (F.mse_loss(p_r, t_r) + F.mse_loss(p_c, t_c) + F.mse_loss(p_s, t_s))
             
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
-            self.detach_state() # Keep it recurrent but bounded
+            self.detach_state()
             
         return total_loss / len(input_sequence)

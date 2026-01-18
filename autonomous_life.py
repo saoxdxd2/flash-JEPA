@@ -1,6 +1,6 @@
 from brain.evolutionary_brain import EvolutionaryBrain
 from brain.population import PopulationManager
-from brain.n2n import KnowledgeLoader
+from brain.training.knowledge_transfer import KnowledgeLoader
 import time
 import sys
 import os

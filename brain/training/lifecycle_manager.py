@@ -6,7 +6,7 @@ import psutil
 from brain.evolutionary_brain import EvolutionaryBrain
 from brain.genome import Genome
 from scripts.start_n2n2_qwen3_agentic import Qwen3Teacher
-from brain.n2n2 import HyperTransfer
+from brain.training.knowledge_transfer import HyperTransfer
 
 class LifecycleManager:
     """
