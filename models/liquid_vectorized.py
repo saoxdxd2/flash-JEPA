@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import random
 from models.plasticity_mlp import PlasticityMLP
-from brain.modules.device import get_best_device
+from brain.utils import get_best_device
 
 class VectorizedLiquidGraph(nn.Module):
     """

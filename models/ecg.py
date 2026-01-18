@@ -2,7 +2,7 @@ from models.liquid_vectorized import VectorizedLiquidGraph
 from models.neuromodulated_holographic import NeuromodulatedHolographicBrain
 
 import torch.nn as nn
-from brain.modules.device import get_best_device
+from brain.utils import get_best_device
 
 class ModularBrain(nn.Module):
     """
@@ -14,7 +14,7 @@ class ModularBrain(nn.Module):
     
     Evolution determines the 'Language' of the Concept Vector.
     """
-    def __init__(self, input_size, hidden_size, output_size, genome=None, use_neuromodulated=True, use_sparse=False):
+    def __init__(self, input_size, hidden_size, output_size, genome=None, use_neuromodulated=True, use_sparse=False, memory_size=None):
         super().__init__()
         # Configuration
         self.input_size = input_size
@@ -22,6 +22,7 @@ class ModularBrain(nn.Module):
         self.use_neuromodulated = use_neuromodulated
         self.use_sparse = use_sparse
         self.device = get_best_device()
+        self.memory_size = memory_size
         
         # Architecture Hyperparameters
         # We split the hidden_size budget between the two cortices
@@ -47,13 +48,22 @@ class ModularBrain(nn.Module):
         # Output: Bus (bus_size)
         sparsity = getattr(genome, 'sparsity', 0.8) if genome else 0.8
         
-        self.visual_cortex = GraphClass(
-            input_size=input_size,
-            hidden_size=self.visual_hidden,
-            output_size=self.bus_size,
-            genome=genome,
-            sparsity=sparsity
-        )
+        if self.use_neuromodulated:
+            self.visual_cortex = GraphClass(
+                input_size=input_size,
+                hidden_size=self.visual_hidden,
+                output_size=self.bus_size,
+                genome=genome,
+                memory_size=memory_size
+            )
+        else:
+            self.visual_cortex = GraphClass(
+                input_size=input_size,
+                hidden_size=self.visual_hidden,
+                output_size=self.bus_size,
+                genome=genome,
+                sparsity=sparsity
+            )
         
         # 2. Motor Cortex
         # Input: Bus (bus_size)
@@ -66,10 +76,15 @@ class ModularBrain(nn.Module):
             sparsity=sparsity
         )
 
-    def forward(self, input_vector, dt=0.1, reward=0.0, chemicals=None, train_internal_rl=True):
+    def forward(self, input_vector, dt=0.1, reward=0.0, chemicals=None, train_internal_rl=True, memory_input=None):
         # 1. Visual Cortex
         # Returns: bus, value, energy, flash_info
-        res_v = self.visual_cortex(input_vector, dt=dt, reward=reward, chemicals=chemicals, train_internal_rl=train_internal_rl)
+        if self.use_neuromodulated:
+            res_v = self.visual_cortex(input_vector, dt=dt, reward=reward, chemicals=chemicals, train_internal_rl=train_internal_rl, memory_input=memory_input)
+        else:
+            res_v = self.visual_cortex(input_vector, dt=dt, reward=reward, chemicals=chemicals, train_internal_rl=train_internal_rl)
+            
+        bus, _, v_energy, v_flash = res_v
         bus, _, v_energy, v_flash = res_v
         
         # 2. Motor Cortex

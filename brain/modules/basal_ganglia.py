@@ -6,11 +6,41 @@ Implements the Direct/Indirect pathway model of the basal ganglia:
 - Direct Pathway (Go): D1 receptors → Facilitates rewarded actions
 - Indirect Pathway (NoGo): D2 receptors → Suppresses unrewarded actions
 - Dopamine TD-Learning: Modulates striatal plasticity
+
+Reference: Frank, M.J. (2005). Dynamic dopamine modulation in the basal ganglia
 """
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# === CONFIGURATION CONSTANTS ===
+# These parameters control the dopamine-modulated action selection
+
+# Go/NoGo Pathway Modulation
+DOPAMINE_GO_MODULATION = 1.0      # Base modulation for D1 (Go) pathway
+DOPAMINE_NOGO_SUPPRESSION = 0.5  # How much dopamine suppresses D2 (NoGo)
+
+# Basal Ganglia Weighting
+BG_WEIGHT_MIN = 0.1              # Minimum influence of BG on final decision
+BG_WEIGHT_MAX = 0.9              # Maximum influence of BG on final decision
+BG_WEIGHT_DOPAMINE_SCALE = 0.5   # How much dopamine affects BG vs cortex balance
+BG_WEIGHT_BASELINE = 0.25        # Baseline BG influence
+
+# Temperature Parameters for Action Selection
+TEMPERATURE_MIN = 0.1            # Minimum temperature (exploitation)
+TEMPERATURE_DOPAMINE_SCALE = 0.5 # How much dopamine reduces temperature
+
+# System 1 vs System 2 Thresholds
+SYSTEM_1_BASE_THRESHOLD = 0.7     # Base confidence threshold for System 1
+SYSTEM_1_DOPAMINE_REDUCTION = 0.2 # How much dopamine lowers threshold
+SYSTEM_1_CONFIDENCE_REDUCTION = 0.1  # How much internal confidence lowers threshold
+SURPRISE_THRESHOLD_FOR_SYSTEM1 = 0.15  # Maximum surprise for System 1 usage
+
+# Legacy System 1 Threshold
+LEGACY_SYSTEM_1_THRESHOLD = 0.8
+LEGACY_SURPRISE_THRESHOLD = 0.2
 
 
 class NeuralBasalGanglia(nn.Module):
@@ -104,11 +134,11 @@ class NeuralBasalGanglia(nn.Module):
         
         # === 2. GO PATHWAY (D1) ===
         # Dopamine *modulates* D1 directly (high DA → more Go)
-        go_signal = self.d1_go(striatum) * (1.0 + dopamine)
+        go_signal = self.d1_go(striatum) * (DOPAMINE_GO_MODULATION + dopamine)
         
         # === 3. NOGO PATHWAY (D2) ===  
         # Dopamine *inhibits* D2 (high DA → less NoGo)
-        nogo_signal = self.d2_nogo(striatum) * (1.0 - dopamine * 0.5)
+        nogo_signal = self.d2_nogo(striatum) * (1.0 - dopamine * DOPAMINE_NOGO_SUPPRESSION)
         
         # === 4. STN (GLOBAL PAUSE) ===
         # Surprise triggers global inhibition ("hold on, let me think")
@@ -125,7 +155,11 @@ class NeuralBasalGanglia(nn.Module):
         # === 6. THALAMIC OUTPUT ===
         # Blend basal ganglia output with cortical proposals
         # High dopamine → trust BG, Low dopamine → trust cortex
-        bg_weight = torch.clamp(torch.tensor(dopamine * 0.5 + 0.25), 0.1, 0.9)
+        bg_weight = torch.clamp(
+            torch.tensor(dopamine * BG_WEIGHT_DOPAMINE_SCALE + BG_WEIGHT_BASELINE), 
+            BG_WEIGHT_MIN, 
+            BG_WEIGHT_MAX
+        )
         
         if action_logits.dim() == 1:
             action_logits = action_logits.unsqueeze(0)
@@ -156,9 +190,13 @@ class NeuralBasalGanglia(nn.Module):
                 flash_confidence = flash_confidence.mean().item()
                 
         # System 1 threshold based on internal confidence
-        system_1_threshold = 0.7 - (dopamine * 0.2) - (confidence.item() * 0.1)
+        system_1_threshold = (
+            SYSTEM_1_BASE_THRESHOLD - 
+            (dopamine * SYSTEM_1_DOPAMINE_REDUCTION) - 
+            (confidence.item() * SYSTEM_1_CONFIDENCE_REDUCTION)
+        )
         
-        if flash_actions is not None and flash_confidence > system_1_threshold and surprise < 0.15:
+        if flash_actions is not None and flash_confidence > system_1_threshold and surprise < SURPRISE_THRESHOLD_FOR_SYSTEM1:
             used_system = 1
             output_logits = flash_actions if flash_actions.dim() > 1 else flash_actions.unsqueeze(0)
         else:
@@ -174,7 +212,7 @@ class NeuralBasalGanglia(nn.Module):
             action = int(np.argmax(logits_np))
         else:
             # Temperature based on dopamine (high DA → more exploitation)
-            temperature = max(0.1, 1.0 - dopamine * 0.5)
+            temperature = max(TEMPERATURE_MIN, 1.0 - dopamine * TEMPERATURE_DOPAMINE_SCALE)
             exp_logits = np.exp((logits_np - np.max(logits_np)) / temperature)
             probs = exp_logits / (np.sum(exp_logits) + 1e-8)
             
@@ -289,9 +327,9 @@ class BasalGanglia:
             if hasattr(flash_confidence, 'item'):
                 flash_confidence = flash_confidence.item()
 
-        system_1_threshold = 0.8 - (dopamine * 0.2)
+        system_1_threshold = LEGACY_SYSTEM_1_THRESHOLD - (dopamine * SYSTEM_1_DOPAMINE_REDUCTION)
         
-        if flash_actions is not None and flash_confidence > system_1_threshold and surprise < 0.2:
+        if flash_actions is not None and flash_confidence > system_1_threshold and surprise < LEGACY_SURPRISE_THRESHOLD:
             final_logits = flash_actions
             used_system = 1
         else:
@@ -307,7 +345,7 @@ class BasalGanglia:
         if greedy:
             return np.argmax(final_logits), used_system
             
-        temperature = max(0.1, 1.0 - dopamine)
+        temperature = max(TEMPERATURE_MIN, 1.0 - dopamine)
         exp_logits = np.exp((final_logits - np.max(final_logits)) / temperature)
         probs = exp_logits / np.sum(exp_logits)
         

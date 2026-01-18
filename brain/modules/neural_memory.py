@@ -178,11 +178,12 @@ class TitansMemory(nn.Module):
             
         print(f"TitansMemory: Resizing {self.input_dim}x{self.hidden_dim} -> {new_input_dim}x{new_hidden_dim}")
         
-        # 1. Grow Indices and Values if needed
+        # 1. Handle Indices and Values (Growth or Shrink)
         old_num_weights = len(self.values)
         new_num_weights = int(new_input_dim * new_hidden_dim * (1.0 - self.sparsity))
         
         if new_num_weights > old_num_weights:
+            # GROWTH
             growth = new_num_weights - old_num_weights
             
             # New random indices in the FULL new range
@@ -200,12 +201,28 @@ class TitansMemory(nn.Module):
             self.values = nn.Parameter(updated_values)
             self._needs_rebuild = True
             
+        elif new_input_dim < self.input_dim or new_hidden_dim < self.hidden_dim:
+            # SHRINKING
+            # Filter indices that are within the new bounds
+            mask = (self.indices[0] < new_input_dim) & (self.indices[1] < new_hidden_dim)
+            
+            # If we have too few weights after filtering, we might need to add some?
+            # For now, just keep the valid ones.
+            
+            self.register_buffer('indices', self.indices[:, mask])
+            self.values = nn.Parameter(self.values.data[mask])
+            self._needs_rebuild = True
+
         # 2. Resize Bias
         if new_hidden_dim > self.hidden_dim:
+            # Growth
             growth = new_hidden_dim - self.hidden_dim
             new_bias = torch.zeros(growth)
             updated_bias = torch.cat([self.bias.data, new_bias])
             self.bias = nn.Parameter(updated_bias)
+        elif new_hidden_dim < self.hidden_dim:
+            # Shrink
+            self.bias = nn.Parameter(self.bias.data[:new_hidden_dim])
             
         self.input_dim = new_input_dim
         self.hidden_dim = new_hidden_dim

@@ -1,195 +1,250 @@
-import pyautogui
+import ctypes
 import time
 import platform
-import subprocess
+import math
+from ctypes import wintypes
 
-# Failsafe
-pyautogui.FAILSAFE = True
+# --- Windows API Constants ---
+INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
+INPUT_HARDWARE = 2
+
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+KEYEVENTF_SCANCODE = 0x0008
+
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_MIDDLEDOWN = 0x0020
+MOUSEEVENTF_MIDDLEUP = 0x0040
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_WHEEL = 0x0800
+
+# --- Ctypes Structures ---
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long),
+                ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", ctypes.c_ulong),
+                ("wParamL", ctypes.c_ushort),
+                ("wParamH", ctypes.c_ushort)]
+
+class INPUT(ctypes.Structure):
+    class _INPUT(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT),
+                    ("ki", KEYBDINPUT),
+                    ("hi", HARDWAREINPUT)]
+    _anonymous_ = ("_input",)
+    _fields_ = [("type", ctypes.c_ulong),
+                ("_input", _INPUT)]
+
+# --- Scan Code Map (Hardware Level) ---
+# Maps index (0-35) to Scan Code
+# 0-25: A-Z
+# 26-35: 0-9
+SCAN_CODE_MAP = [
+    0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, # A-J
+    0x25, 0x26, 0x32, 0x31, 0x18, 0x19, 0x10, 0x13, 0x1F, 0x14, # K-T
+    0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C,                         # U-Z
+    0x0B, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A  # 0-9 (0 is 0x0B, 1 is 0x02...)
+]
+
+SPECIAL_KEYS_MAP = {
+    'enter': 0x1C,
+    'space': 0x39,
+    'backspace': 0x0E,
+    'tab': 0x0F,
+    'esc': 0x01,
+    'up': 0x48, # Extended
+    'down': 0x50, # Extended
+    'left': 0x4B, # Extended
+    'right': 0x4D, # Extended
+}
 
 class Cradle:
     """
-    Cradle: The Physical Body of the Agent.
-    Implements General Computer Control (GCC) Interface standards.
-    Handles all IO (Mouse, Keyboard, Screen, System).
+    Cradle: High-Performance Direct Neural Interface.
+    Uses direct Windows API calls for millisecond-precision input.
     """
     def __init__(self):
-        self.os_name = platform.system()
-        self.screen_width, self.screen_height = pyautogui.size()
-        self.mouse_speed = 0.2 # Default duration
+        self.user32 = ctypes.windll.user32
+        self.screen_width = self.user32.GetSystemMetrics(0)
+        self.screen_height = self.user32.GetSystemMetrics(1)
         
-        # Action Space Mapping (Standardized)
-        self.special_keys = {
-            'enter': 'enter',
-            'space': 'space',
-            'backspace': 'backspace',
-            'tab': 'tab',
-            'esc': 'esc',
-            'up': 'up',
-            'down': 'down',
-            'left': 'left',
-            'right': 'right',
-            'ctrl': 'ctrl',
-            'alt': 'alt',
-            'shift': 'shift',
-            'win': 'win', # Windows key
-            'cmd': 'command', # Mac
-        }
+    def _send_input(self, input_struct):
+        self.user32.SendInput(1, ctypes.byref(input_struct), ctypes.sizeof(INPUT))
 
-    def get_screen_size(self):
-        return self.screen_width, self.screen_height
-
-    def move_mouse(self, x, y, duration=None):
-        """
-        Move mouse to normalized coordinates (0.0-1.0).
-        """
-        if duration is None:
-            duration = self.mouse_speed
-            
-        # Clamp
-        x = max(0.0, min(1.0, x))
-        y = max(0.0, min(1.0, y))
+    def move_mouse(self, x, y):
+        """Absolute movement (0.0-1.0) using normalized coordinates."""
+        # Windows expects 0-65535 for absolute coordinates
+        nx = int(x * 65535)
+        ny = int(y * 65535)
         
-        tx = int(x * self.screen_width)
-        ty = int(y * self.screen_height)
-        
-        try:
-            pyautogui.moveTo(tx, ty, duration=duration)
-            return True
-        except pyautogui.FailSafeException:
-            print("CRADLE: Failsafe Triggered (Corner Reached)")
-            return False
+        mi = MOUSEINPUT(dx=nx, dy=ny, mouseData=0, dwFlags=MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, time=0, dwExtraInfo=None)
+        inp = INPUT(type=INPUT_MOUSE, _input=INPUT._INPUT(mi=mi))
+        self._send_input(inp)
+        return True
 
     def click(self, button='left', double=False):
-        try:
-            if double:
-                pyautogui.doubleClick(button=button)
-            else:
-                pyautogui.click(button=button)
-            return True
-        except Exception as e:
-            print(f"CRADLE Error (Click): {e}")
-            return False
-
-    def drag(self, x, y, duration=0.5):
-        """Drag to normalized coordinates."""
-        tx = int(x * self.screen_width)
-        ty = int(y * self.screen_height)
-        try:
-            pyautogui.dragTo(tx, ty, duration=duration, button='left')
-            return True
-        except Exception:
-            return False
-
-    def type_text(self, text, interval=0.05):
-        try:
-            pyautogui.write(text, interval=interval)
-            return True
-        except Exception:
-            return False
-
-    def press_key(self, key_name):
-        try:
-            k = self.special_keys.get(key_name, key_name)
-            pyautogui.press(k)
-            return True
-        except Exception:
-            return False
-
-    def hotkey(self, *keys):
-        try:
-            pyautogui.hotkey(*keys)
-            return True
-        except Exception:
-            return False
-
-    def scroll(self, clicks):
-        try:
-            pyautogui.scroll(clicks)
-            return True
-        except Exception:
-            return False
-
-    def execute_action(self, action_dict):
-        """
-        Execute a high-level action dictionary (GCC format).
-        Example: {'type': 'click', 'button': 'left'}
-                 {'type': 'type', 'text': 'hello'}
-        """
-        action_type = action_dict.get('type')
-        
-        if action_type == 'move':
-            return self.move_mouse(action_dict['x'], action_dict['y'])
-        elif action_type == 'click':
-            return self.click(button=action_dict.get('button', 'left'), double=action_dict.get('double', False))
-        elif action_type == 'drag':
-            return self.drag(action_dict['x'], action_dict['y'])
-        elif action_type == 'type':
-            return self.type_text(action_dict['text'])
-        elif action_type == 'key':
-            return self.press_key(action_dict['key'])
-        elif action_type == 'scroll':
-            return self.scroll(action_dict['amount'])
-        elif action_type == 'wait':
-            time.sleep(action_dict.get('duration', 0.1))
-            return True
-            
-        return False
-
-    def execute_code(self, code, gaze_pos=None):
-        """
-        Executes an integer action code (Evolutionary Interface).
-        gaze_pos: (x, y) tuple of current gaze/cursor position for relative movement.
-        If None, fetches actual mouse position.
-        """
-        if gaze_pos is None:
-            mx, my = pyautogui.position()
-            gx, gy = mx / self.screen_width, my / self.screen_height
+        if button == 'left':
+            down = MOUSEEVENTF_LEFTDOWN
+            up = MOUSEEVENTF_LEFTUP
+        elif button == 'right':
+            down = MOUSEEVENTF_RIGHTDOWN
+            up = MOUSEEVENTF_RIGHTUP
         else:
-            gx, gy = gaze_pos
-        
-        try:
-            if code == 1: return self.click()
-            elif code == 2: return self.move_mouse(gx + 0.05, gy) # Right
-            elif code == 3: return self.move_mouse(gx - 0.05, gy) # Left
-            elif code == 4: return self.move_mouse(gx, gy + 0.05) # Down
-            elif code == 5: return self.move_mouse(gx, gy - 0.05) # Up
-            elif code == 6: return self.scroll(-100)
-            elif code == 7: return self.scroll(100)
-            elif code == 8: return self.press_key('enter')
-            elif code == 9: return self.press_key('backspace')
-            
-            # Typing A-Z (15-40)
-            elif 15 <= code <= 40:
-                char = chr(code - 15 + 97)
-                return self.type_text(char)
-                
-            # Special Keys
-            elif code == 41: return self.press_key('space')
-            elif 42 <= code <= 51: return self.type_text(str(code - 42)) # 0-9
-            
-            # Symbols
-            symbols = {52: '+', 53: '-', 54: '*', 55: '=', 56: '?', 57: '(', 58: ')', 
-                       59: '"', 60: ':', 61: '/', 62: '.', 63: ',', 64: '#'}
-            if code in symbols:
-                return self.type_text(symbols[code])
-                
-            elif code == 65: return self.press_key('f5')
-            
-            # Navigation (Moved to 66-69 to avoid conflict with Numbers 42-51)
-            elif code == 66: return self.press_key('up')
-            elif code == 67: return self.press_key('down')
-            elif code == 68: return self.press_key('left')
-            elif code == 69: return self.press_key('right')
-            
-            # Advanced Shortcuts (70+)
-            elif code == 70: return self.press_key('esc')
-            elif code == 71: return self.press_key('tab')
-            elif code == 72: return self.hotkey('ctrl', 'c')
-            elif code == 73: return self.hotkey('ctrl', 'v')
-            elif code == 74: return self.hotkey('alt', 'tab')
-            elif code == 75: return self.hotkey('win', 'r') # Run dialog
-            
-            return True
-        except Exception as e:
-            print(f"Cradle Execution Error: {e}")
             return False
+            
+        # Click = Down + Up
+        mi_down = MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=down, time=0, dwExtraInfo=None)
+        inp_down = INPUT(type=INPUT_MOUSE, _input=INPUT._INPUT(mi=mi_down))
+        self._send_input(inp_down)
+        
+        mi_up = MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=up, time=0, dwExtraInfo=None)
+        inp_up = INPUT(type=INPUT_MOUSE, _input=INPUT._INPUT(mi=mi_up))
+        self._send_input(inp_up)
+        
+        if double:
+            # Repeat
+            self._send_input(inp_down)
+            self._send_input(inp_up)
+            
+        return True
+
+    def scroll(self, amount):
+        mi = MOUSEINPUT(dx=0, dy=0, mouseData=amount, dwFlags=MOUSEEVENTF_WHEEL, time=0, dwExtraInfo=None)
+        inp = INPUT(type=INPUT_MOUSE, _input=INPUT._INPUT(mi=mi))
+        self._send_input(inp)
+        return True
+
+    def press_key(self, scan_code, extended=False):
+        flags = KEYEVENTF_SCANCODE
+        if extended:
+            flags |= KEYEVENTF_EXTENDEDKEY
+            
+        # Key Down
+        ki_down = KEYBDINPUT(wVk=0, wScan=scan_code, dwFlags=flags, time=0, dwExtraInfo=None)
+        inp_down = INPUT(type=INPUT_KEYBOARD, _input=INPUT._INPUT(ki=ki_down))
+        self._send_input(inp_down)
+        
+        # Key Up
+        ki_up = KEYBDINPUT(wVk=0, wScan=scan_code, dwFlags=flags | KEYEVENTF_KEYUP, time=0, dwExtraInfo=None)
+        inp_up = INPUT(type=INPUT_KEYBOARD, _input=INPUT._INPUT(ki=ki_up))
+        self._send_input(inp_up)
+        return True
+
+    def execute_distributed(self, intent_code, params):
+        """
+        Executes a distributed action using Fast Input.
+        """
+        try:
+            if hasattr(params, 'cpu'): params = params.cpu().numpy()
+            if hasattr(params, 'flatten'): params = params.flatten()
+            
+            # 0: Move Mouse
+            if intent_code == 0:
+                x, y = params[0], params[1]
+                x = max(0.0, min(1.0, x))
+                y = max(0.0, min(1.0, y))
+                return self.move_mouse(x, y)
+                
+            # 1: Left Click
+            elif intent_code == 1:
+                return self.click(button='left')
+                
+            # 2: Right Click
+            elif intent_code == 2:
+                return self.click(button='right')
+                
+            # 3: Double Click
+            elif intent_code == 3:
+                return self.click(button='left', double=True)
+                
+            # 4: Type Character (Direct Scan Code Mapping)
+            elif intent_code == 4:
+                char_logits = params[10:] 
+                if len(char_logits) == 0: return False
+                idx = int(params[10:].argmax())
+                
+                if 0 <= idx < len(SCAN_CODE_MAP):
+                    scan_code = SCAN_CODE_MAP[idx]
+                    return self.press_key(scan_code)
+                return False
+                
+            # 5: Special Key
+            elif intent_code == 5:
+                keys = ['enter', 'space', 'backspace', 'tab', 'esc', 'up', 'down', 'left', 'right']
+                idx = int(params[10:].argmax()) % len(keys)
+                key_name = keys[idx]
+                scan_code = SPECIAL_KEYS_MAP.get(key_name, 0)
+                extended = key_name in ['up', 'down', 'left', 'right']
+                if scan_code:
+                    return self.press_key(scan_code, extended=extended)
+                return False
+                
+            # 6: Scroll Up
+            elif intent_code == 6:
+                return self.scroll(120)
+                
+            # 7: Scroll Down
+            elif intent_code == 7:
+                return self.scroll(-120)
+                
+            # 8: Drag (Swipe)
+            elif intent_code == 8:
+                # 1. Move to start (current position is implicit, but we drag TO the target)
+                # Actually, drag usually implies "Press Down Here, Move There, Release".
+                # But our action is instantaneous. So we:
+                # - Press Left Down (at current pos)
+                # - Move to Target (x, y)
+                # - Release Left Up
+                
+                x, y = params[0], params[1]
+                x = max(0.0, min(1.0, x))
+                y = max(0.0, min(1.0, y))
+                
+                # Down
+                mi_down = MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=MOUSEEVENTF_LEFTDOWN, time=0, dwExtraInfo=None)
+                self._send_input(INPUT(type=INPUT_MOUSE, _input=INPUT._INPUT(mi=mi_down)))
+                
+                # Move
+                nx = int(x * 65535)
+                ny = int(y * 65535)
+                mi_move = MOUSEINPUT(dx=nx, dy=ny, mouseData=0, dwFlags=MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, time=0, dwExtraInfo=None)
+                self._send_input(INPUT(type=INPUT_MOUSE, _input=INPUT._INPUT(mi=mi_move)))
+                
+                # Up
+                mi_up = MOUSEINPUT(dx=0, dy=0, mouseData=0, dwFlags=MOUSEEVENTF_LEFTUP, time=0, dwExtraInfo=None)
+                self._send_input(INPUT(type=INPUT_MOUSE, _input=INPUT._INPUT(mi=mi_up)))
+                
+                return True
+                
+            # 9: Wait
+            elif intent_code == 9:
+                return True
+                
+            return False
+            
+        except Exception as e:
+            print(f"Cradle Fast Error: {e}")
+            return False
+            
+    # Legacy Support
+    def execute_code(self, code, gaze_pos=None):
+        pass # Deprecated

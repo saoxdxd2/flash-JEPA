@@ -1,7 +1,50 @@
+"""
+Neuromodulated Holographic Brain: Hybrid H-NH-JEPA Architecture
+
+This module implements a hierarchical neural architecture with:
+- Holographic wavelet encoding for spatial perception
+- Sparse linear layers for CPU-efficient computation
+- Neuromodulated gating for chemical state integration
+- Multi-level temporal dynamics (reflex → concept → strategy)
+- Flash path (System 1) for rapid responses
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+
+# === CONFIGURATION CONSTANTS ===
+# These control the architecture and behavior of the holographic brain
+
+# Sparse Linear Layer Defaults
+DEFAULT_SPARSITY = 0.99          # Default connection sparsity (99% sparse)
+MIN_NON_ZERO_CONNECTIONS = 1     # Minimum connections to maintain
+SPROUTING_INIT_SCALE = 0.01     # Scale for new connection initialization
+PRUNE_THRESHOLD = 0.01          # Weight magnitude threshold for pruning
+
+# Holographic Encoder
+ENCODER_BASE_RESOLUTION = 16    # Base resolution for 3D encoding
+ENCODER_CHANNELS = [8, 16, 32]  # Channels at each encoding level
+ENCODED_SIZE = 256              # 32 * 2 * 2 * 2 = 256
+
+# Hidden State Clipping (for stability)
+HIDDEN_STATE_CLIP_MIN = -5.0
+HIDDEN_STATE_CLIP_MAX = 5.0
+
+# Temporal Dynamics (time constant ranges)
+TAU_REFLEX_RANGE = (0.01, 0.11)   # Fast reflexes: 10-110ms
+TAU_CONCEPT_RANGE = (0.1, 0.5)   # Medium concepts: 100-500ms
+TAU_STRATEGY_RANGE = (1.0, 10.0) # Slow strategies: 1-10s
+
+# Router Block Size
+ROUTER_BLOCK_SIZE = 64
+
+# Default chemical state (dopamine, serotonin, norepinephrine, cortisol)
+DEFAULT_CHEMICALS = [0.5, 0.5, 0.2, 0.0]
+
+# SSI Learning
+SSI_JEPA_CONSISTENCY_WEIGHT = 0.1
 
 class SparseLinear(nn.Module):
     """
@@ -16,13 +59,22 @@ class SparseLinear(nn.Module):
         
         # Initialize sparse weights
         num_non_zero = int(in_features * out_features * (1 - sparsity))
-        num_non_zero = max(num_non_zero, 1)
+        num_non_zero = max(num_non_zero, MIN_NON_ZERO_CONNECTIONS)
         
-        # We store indices as a buffer and values as a parameter
-        self.register_buffer('indices', torch.randint(0, in_features, (2, num_non_zero)))
-        self.indices[1] = torch.randint(0, out_features, (num_non_zero,))
+        # Generate random indices
+        indices = torch.randint(0, in_features, (2, num_non_zero))
+        indices[1] = torch.randint(0, out_features, (num_non_zero,))
         
-        self.values = nn.Parameter(torch.randn(num_non_zero) * (1.0 / np.sqrt(in_features)))
+        # Coalesce to remove duplicates immediately
+        # We use a temporary tensor to do this
+        temp_vals = torch.randn(num_non_zero)
+        temp_coo = torch.sparse_coo_tensor(indices, temp_vals, (in_features, out_features)).coalesce()
+        
+        # Use the coalesced indices and values size
+        self.register_buffer('indices', temp_coo.indices())
+        
+        real_num_non_zero = self.indices.shape[1]
+        self.values = nn.Parameter(torch.randn(real_num_non_zero) * (1.0 / np.sqrt(in_features)))
         self.bias = nn.Parameter(torch.zeros(out_features))
         
         # CSR Cache (for CPU efficiency)
@@ -110,7 +162,7 @@ class SparseLinear(nn.Module):
             self.indices = torch.cat([self.indices, new_idx.to(self.indices.device)], dim=1)
             
             # Initialize new values
-            new_vals = torch.randn(num_new, device=self.values.device) * 0.01
+            new_vals = torch.randn(num_new, device=self.values.device) * SPROUTING_INIT_SCALE
             self.values = nn.Parameter(torch.cat([self.values, new_vals]))
             
             # Reset CSR cache
@@ -120,7 +172,7 @@ class SparseLinear(nn.Module):
             self.activity_in.zero_()
             self.activity_out.zero_()
 
-    def prune(self, threshold=0.01):
+    def prune(self, threshold=PRUNE_THRESHOLD):
         """Removes connections with low weights."""
         with torch.no_grad():
             mask = self.values.abs() > threshold
@@ -144,7 +196,7 @@ class SparseLinear(nn.Module):
         
         # Create new indices and values
         num_non_zero = int(in_features * out_features * (1 - self.sparsity))
-        num_non_zero = max(num_non_zero, 1)
+        num_non_zero = max(num_non_zero, MIN_NON_ZERO_CONNECTIONS)
         
         new_indices = torch.randint(0, in_features, (2, num_non_zero))
         new_indices[1] = torch.randint(0, out_features, (num_non_zero,))
@@ -169,11 +221,12 @@ class NeuromodulatedHolographicBrain(nn.Module):
     """
     Hybrid H-NH-JEPA Architecture.
     """
-    def __init__(self, input_size, hidden_size, output_size, genome=None, **kwargs):
+    def __init__(self, input_size, hidden_size, output_size, genome=None, memory_size=None, **kwargs):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
+        self.memory_size = memory_size
         
         # --- 1. Holographic Wavelet Encoder ---
         self.base_res = 16
@@ -185,6 +238,24 @@ class NeuromodulatedHolographicBrain(nn.Module):
         
         self.encoded_size = 32 * 2 * 2 * 2 # 256
         self.input_projection = nn.Linear(input_size, self.base_res**3)
+        
+        # --- 1.5 Thalamic Gate (Structural Infinite Regression) ---
+        if self.memory_size is not None and self.memory_size > 0:
+            # Projects memory (e.g. 768) to encoded space (256)
+            self.memory_projection = nn.Linear(self.memory_size, self.encoded_size)
+            
+            # Gating Controller: Decides mixing ratio based on Chemicals + Signal Strength
+            # Input: Encoded Sensory (256) + Projected Memory (256) + Chemicals (4)
+            # Output: 1 scalar (Alpha: 0=Memory, 1=Sensory)
+            self.thalamus_gate = nn.Sequential(
+                nn.Linear(self.encoded_size * 2 + 4, 32),
+                nn.Tanh(),
+                nn.Linear(32, 1),
+                nn.Sigmoid()
+            )
+        else:
+            self.memory_projection = None
+            self.thalamus_gate = None
         
         # --- 2. Hierarchical Dimensions ---
         r_size = hidden_size // 4
@@ -249,10 +320,12 @@ class NeuromodulatedHolographicBrain(nn.Module):
                             mask = (module.indices[1] >= b*64) & (module.indices[1] < (b+1)*64)
                             module.values.data[mask] += torch.randn(mask.sum()) * 0.01 * (b / num_blocks)
         
-    def forward(self, input_vector, dt=0.1, reward=0.0, chemicals=None, train_internal_rl=True):
+    def forward(self, input_vector, dt=0.1, reward=0.0, chemicals=None, train_internal_rl=True, memory_input=None):
         input_vector = input_vector.float()
         if chemicals is not None:
             chemicals = chemicals.float()
+        if memory_input is not None:
+            memory_input = memory_input.float()
         if input_vector.dim() == 1:
             input_vector = input_vector.unsqueeze(0)
         batch_size = input_vector.shape[0]
@@ -276,6 +349,38 @@ class NeuromodulatedHolographicBrain(nn.Module):
         for layer in self.encoder_levels:
             curr = F.relu(layer(curr))
         encoded_input = curr.flatten(1)
+        
+        # --- 1.5 Thalamic Gating ---
+        if self.thalamus_gate is not None and memory_input is not None:
+            if memory_input.dim() == 1: memory_input = memory_input.unsqueeze(0)
+            
+            # Project Memory to Encoded Space
+            encoded_memory = self.memory_projection(memory_input)
+            
+            # Default chemicals if missing
+            if chemicals is None:
+                chem_vec = torch.tensor([0.5, 0.5, 0.2, 0.0], device=input_vector.device).repeat(batch_size, 1)
+            else:
+                chem_vec = chemicals
+                
+            # Calculate Gate Alpha
+            # We want Alpha to be high when Norepinephrine (Arousal) is high
+            # We want Alpha to be low when Serotonin is high (Sleep)
+            # The network learns this mapping, but we can bias it or let it emerge.
+            # For now, we let the network learn the optimal mixing based on the state.
+            gate_input = torch.cat([encoded_input, encoded_memory, chem_vec], dim=1)
+            alpha = self.thalamus_gate(gate_input)
+            
+            # Apply Mixing
+            # Reality (encoded_input) vs Dream (encoded_memory)
+            # Note: During silence, encoded_input might be zeros or noise.
+            # If Alpha is 0, we fully hallucinate.
+            encoded_input = (alpha * encoded_input) + ((1.0 - alpha) * encoded_memory)
+            
+            # Add Thalamic Noise (Stochastic Resonance)
+            if self.training:
+                noise = torch.randn_like(encoded_input) * 0.01
+                encoded_input = encoded_input + noise
         
         # --- 2. Neuromodulated Gating ---
         if chemicals is None:
@@ -318,9 +423,9 @@ class NeuromodulatedHolographicBrain(nn.Module):
         self.h_strategy = self.h_strategy + g_strategy * (target_strategy - self.h_strategy) * (dt / self.tau_strategy)
         
         # Stability: Clip hidden states
-        self.h_reflex = torch.clamp(self.h_reflex, -5.0, 5.0)
-        self.h_concept = torch.clamp(self.h_concept, -5.0, 5.0)
-        self.h_strategy = torch.clamp(self.h_strategy, -5.0, 5.0)
+        self.h_reflex = torch.clamp(self.h_reflex, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
+        self.h_concept = torch.clamp(self.h_concept, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
+        self.h_strategy = torch.clamp(self.h_strategy, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
         
         # --- 6. Latent Prediction (JEPA) ---
         p_reflex = self.P_reflex(self.h_reflex)
@@ -496,7 +601,7 @@ class NeuromodulatedHolographicBrain(nn.Module):
             if t < len(target_h_sequence) - 1:
                 next_target = target_h_sequence[t+1]
                 t_r, t_c, t_s = torch.split(next_target, [r_size, c_size, s_size], dim=1)
-                loss += 0.1 * (F.mse_loss(p_r, t_r) + F.mse_loss(p_c, t_c) + F.mse_loss(p_s, t_s))
+            loss += SSI_JEPA_CONSISTENCY_WEIGHT * (F.mse_loss(p_r, t_r) + F.mse_loss(p_c, t_c) + F.mse_loss(p_s, t_s))
             
             loss.backward()
             optimizer.step()

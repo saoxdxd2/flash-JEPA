@@ -1,7 +1,37 @@
+"""
+Prioritized Experience Replay Buffer
+
+Implements SumTree-based prioritized experience replay for efficient
+TD-error weighted sampling. High-error experiences are sampled more
+frequently to accelerate learning.
+
+Reference: Schaul, T. et al. (2015). Prioritized Experience Replay
+"""
 import torch
 import numpy as np
 import random
 from collections import namedtuple, deque
+
+
+# === REPLAY BUFFER CONSTANTS ===
+# These control the prioritized sampling behavior
+
+# Priority Exponent (α): Controls how much prioritization affects sampling
+# α = 0: Uniform sampling (no prioritization)
+# α = 1: Full prioritization based on TD-error
+DEFAULT_PRIORITY_ALPHA = 0.6
+
+# Importance-Sampling Exponent (β): Corrects for non-uniform sampling bias
+# β = 0: No correction
+# β = 1: Full correction (should anneal to 1 during training)
+DEFAULT_IMPORTANCE_BETA = 0.4
+
+# Small constant to prevent zero priority
+PRIORITY_EPSILON = 0.01
+
+# Initial max priority for new experiences
+INITIAL_MAX_PRIORITY = 1.0
+
 
 class SumTree:
     """
@@ -58,17 +88,18 @@ class SumTree:
         dataIdx = idx - self.capacity + 1
         return (idx, self.tree[idx], self.data[dataIdx])
 
+
 class PrioritizedReplayBuffer:
     """
     Prioritized Experience Replay Buffer.
     Stores transitions (state, action, reward, next_state, done) with priorities.
     """
-    def __init__(self, capacity, alpha=0.6):
+    def __init__(self, capacity, alpha=DEFAULT_PRIORITY_ALPHA):
         self.tree = SumTree(capacity)
         self.capacity = capacity
-        self.alpha = alpha # Priority exponent
-        self.epsilon = 0.01 # Small constant to prevent zero priority
-        self.max_p = 1.0 # Track max priority in O(1)
+        self.alpha = alpha  # Priority exponent
+        self.epsilon = PRIORITY_EPSILON  # Small constant to prevent zero priority
+        self.max_p = INITIAL_MAX_PRIORITY  # Track max priority in O(1)
 
     def add(self, state, action, reward, next_state, done):
         """Add a new experience to memory."""

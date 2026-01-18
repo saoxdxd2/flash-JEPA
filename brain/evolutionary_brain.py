@@ -11,11 +11,11 @@ from brain.modules.broca import BrocaModule
 from brain.modules.biology_core import NeurotransmitterSystem
 from brain.modules.amygdala import Amygdala
 from brain.modules.basal_ganglia import BasalGanglia
-from brain.modules.monitor import ResourceMonitor
+from brain.utils import ResourceMonitor, get_best_device, get_memory_stats, check_ram_limit
+from brain.modules.neural_memory import TitansMemory
 from models.ecg import ModularBrain
 from brain.modules.replay_buffer import PrioritizedReplayBuffer
 from brain.modules.cradle import Cradle
-from brain.modules.device import get_best_device, get_memory_stats, check_ram_limit
 from brain.modules.onnx_engine import ONNXEngine
 
 class EvolutionaryBrain:
@@ -35,16 +35,22 @@ class EvolutionaryBrain:
             self.genome.latent_dim = 256
             
         self.latent_dim = self.genome.latent_dim
-        self.input_size = (3 * self.genome.latent_dim) + self.genome.NON_VISUAL_INPUT_SIZE
+        
+        # Input Size: Visual (3*L) + Memory Prediction (3*L) + Bio/Action (Non-Visual)
+        # We add a Hippocampus (Titans Memory) that predicts the next sensory state
+        self.input_size = (6 * self.genome.latent_dim) + self.genome.NON_VISUAL_INPUT_SIZE
+        
         self.hidden_size = self.genome.hidden_size 
         self.action_size = self.genome.action_size 
         
         self.device = get_best_device()
         
         # --- Biological Core ---
-        self.chemistry = NeurotransmitterSystem()
-        self.amygdala = Amygdala()
-        self.basal_ganglia = BasalGanglia(self.action_size)
+        self.chemistry = NeurotransmitterSystem(genome=self.genome)
+        self.amygdala = Amygdala(genome=self.genome)
+        # Distributed Motor Cortex: Basal Ganglia only selects the INTENT (0-9)
+        self.intent_size = 10
+        self.basal_ganglia = BasalGanglia(self.intent_size)
         
         # --- Replay Buffer (Unified System 1/2) ---
         self.replay_buffer = PrioritizedReplayBuffer(capacity=self.genome.REPLAY_BUFFER_CAPACITY)
@@ -58,7 +64,14 @@ class EvolutionaryBrain:
         self.last_energy_cost = 0.0
         
         # --- Cognitive Modules ---
-        self.trm = ModularBrain(self.input_size, self.hidden_size, self.action_size, genome=self.genome, use_neuromodulated=True)
+        self.trm = ModularBrain(
+            self.input_size, 
+            self.hidden_size, 
+            self.action_size, 
+            genome=self.genome, 
+            use_neuromodulated=True,
+            memory_size=3 * self.genome.latent_dim # Pass Memory Size for Thalamic Gating
+        )
         self.trm.set_plasticity(self.genome.plasticity_coefficients, self.genome.learning_rate)
         self.retina = PredictiveRetina(latent_size=self.genome.latent_dim, genome=self.genome)
         self.broca = BrocaModule(
@@ -66,6 +79,14 @@ class EvolutionaryBrain:
             visual_dim=self.genome.latent_dim,
             genome=self.genome
         ).to(self.device)
+        
+        # Hippocampus (Episodic/Working Memory)
+        # Predicts next sensory state (Foveal + Peripheral + Semantic)
+        self.hippocampus = TitansMemory(
+            input_dim=3 * self.genome.latent_dim,
+            hidden_dim=3 * self.genome.latent_dim
+        ).to(self.device)
+        
         self.memory = self.replay_buffer 
         
         # --- 8. Latent Adapter (N2N2 Alignment) ---
@@ -123,6 +144,17 @@ class EvolutionaryBrain:
         boosted_input = full_input_tensor.clone()
         boosted_input[:, :3*L] *= self.genome.INPUT_BOOST_FACTOR
         
+        # --- CONSCIOUS/UNCONSCIOUS SEPARATION ---
+        # Hide the raw biological state from the "Conscious" input stream.
+        # The Conscious mind (Concept/Strategy) sees the World, not the Machinery.
+        # The Unconscious (Reflex/Thalamus) sees the Machinery via the 'chemicals' channel.
+        
+        # Bio-state is at indices [6*L : 6*L + 8] (approx, depending on implementation)
+        # We zero it out in the main vector so it doesn't get encoded into the conscious stream.
+        bio_start = 6 * L
+        bio_end = bio_start + 8 # Dopamine, Serotonin, Norepinephrine, Stamina, Surprise, TextDensity, RAM, CPU
+        boosted_input[:, bio_start:bio_end] = 0.0
+        
         chemicals = torch.tensor([
             self.chemistry.dopamine,
             self.chemistry.serotonin,
@@ -153,7 +185,12 @@ class EvolutionaryBrain:
             
             # Hybrid Switching: If confidence is low, fallback to System 2 (PyTorch)
             if confidence.mean().item() < self.genome.CONFIDENCE_THRESHOLD:
-                res = self.trm.forward(boosted_input, chemicals=chemicals, train_internal_rl=train_internal_rl)
+                # Extract Memory Input for Thalamic Gating
+                # Structure: [Foveal(L), Peripheral(L), Semantic(L), Memory(3L), Bio...]
+                L = self.latent_dim
+                memory_input = boosted_input[:, 3*L : 6*L]
+                
+                res = self.trm.forward(boosted_input, chemicals=chemicals, train_internal_rl=train_internal_rl, memory_input=memory_input)
                 logits, value, energy, flash_info = res
             else:
                 logits = torch.from_numpy(logits_np).to(self.device)
@@ -164,7 +201,11 @@ class EvolutionaryBrain:
                 dummy_flash = (logits, confidence, None, None, None, None, None, None)
                 flash_info = dummy_flash
         else:
-            res = self.trm.forward(boosted_input, chemicals=chemicals, train_internal_rl=train_internal_rl)
+            # Extract Memory Input for Thalamic Gating
+            L = self.latent_dim
+            memory_input = boosted_input[:, 3*L : 6*L]
+            
+            res = self.trm.forward(boosted_input, chemicals=chemicals, train_internal_rl=train_internal_rl, memory_input=memory_input)
             logits, value, energy, flash_info = res
         self.last_value = value.mean().item() if torch.is_tensor(value) else value
         
@@ -186,16 +227,29 @@ class EvolutionaryBrain:
             return reflex_action, reflex_logits
             
         # --- 5. Basal Ganglia Gating (System 1 vs 2) ---
-        action, used_system = self.basal_ganglia.gate_action(
-            logits, 
+        # Distributed Motor Control:
+        # Logits [0:10] = Intent (Move, Click, Type...)
+        # Logits [10:]  = Parameters (X, Y, Char...)
+        
+        intent_logits = logits[:, :self.intent_size]
+        param_logits = logits[:, self.intent_size:]
+        
+        # Flash Info also needs to be split if it exists
+        flash_intent = None
+        if flash_info[0] is not None:
+            flash_intent = flash_info[0][:, :self.intent_size]
+            
+        intent_action, used_system = self.basal_ganglia.gate_action(
+            intent_logits, 
             self.chemistry.dopamine, 
-            flash_info=(flash_info[0], flash_info[1]), 
+            flash_info=(flash_intent, flash_info[1]), 
             surprise=surprise,
             greedy=greedy
         )
         
         self.last_used_system = used_system
-        return action, logits
+        # Return Intent Index AND Parameter Logits
+        return intent_action, param_logits
 
     def train_step(self, batch_size=32, distillation=False):
         if len(self.replay_buffer) < batch_size:
@@ -205,6 +259,7 @@ class EvolutionaryBrain:
         if hasattr(self.trm, 'detach_state'):
             self.trm.detach_state()
             
+        batch_size = int(batch_size)
         batch_data, indices, weights = self.replay_buffer.sample(batch_size)
         states = torch.tensor(np.array([x[0] for x in batch_data]), dtype=torch.float32)
         actions = torch.tensor(np.array([x[1] for x in batch_data]), dtype=torch.long)
@@ -244,9 +299,24 @@ class EvolutionaryBrain:
             # We want the ACTUAL hidden states of the next step as targets for JEPA
             _, _, _, (_, _, _, _, _, t_reflex, t_concept, t_strategy) = res_next
         
-        # 1. Standard RL Losses
-        policy_loss = F.cross_entropy(logits, actions)
-        flash_loss = F.cross_entropy(flash_logits, actions)
+        # 1. Standard RL Losses (A2C / PPO-lite)
+        # Calculate Advantage
+        # We use the actual return (reward + gamma * next_value) - value
+        # But here we just use raw reward as a simple proxy for return in this step-based setup
+        # Ideally we should use n-step returns, but for now:
+        advantage = rewards - value.squeeze().detach()
+        
+        # Policy Loss: -log_prob * advantage
+        log_probs = F.log_softmax(logits, dim=1)
+        selected_log_probs = log_probs.gather(1, actions.unsqueeze(1)).squeeze()
+        policy_loss = -(selected_log_probs * advantage).mean()
+        
+        # Flash Loss (System 1) - Also needs to be RL-based or Distilled
+        # For Flash, we can use the same advantage
+        flash_log_probs = F.log_softmax(flash_logits, dim=1)
+        selected_flash_log_probs = flash_log_probs.gather(1, actions.unsqueeze(1)).squeeze()
+        flash_loss = -(selected_flash_log_probs * advantage).mean()
+        
         value_loss = F.mse_loss(value.squeeze(), rewards)
         
         try:
@@ -275,14 +345,6 @@ class EvolutionaryBrain:
             print("DEBUG: NaN Loss detected!")
             return 0.0
             
-        # Log shapes before backward
-        if self.accumulated_reward == 0: # Just once or periodically
-             print(f"DEBUG: Backward Pass Shapes:")
-             print(f"  logits: {logits.shape}, actions: {actions.shape}")
-             print(f"  flash_logits: {flash_logits.shape}")
-             print(f"  value: {value.shape}, rewards: {rewards.shape}")
-             print(f"  p_reflex: {p_reflex.shape}, t_reflex: {t_reflex.shape}")
-             
         try:
             total_loss.backward()
         except RuntimeError as e:
@@ -299,7 +361,7 @@ class EvolutionaryBrain:
         self.last_surprise = jepa_loss.item()
         return total_loss.item()
 
-    def get_input_vector(self, foveal_latent, peripheral_latent, semantic_latent, bio_state=None, prev_action=None):
+    def get_input_vector(self, foveal_latent, peripheral_latent, semantic_latent, bio_state=None, prev_action=None, memory_latent=None):
         if bio_state is None:
             bio_state = torch.tensor([
                 self.chemistry.dopamine, 
@@ -307,7 +369,9 @@ class EvolutionaryBrain:
                 self.chemistry.norepinephrine, 
                 self.stamina,
                 0.0, # Default surprise
-                0.0  # Default text density
+                0.0, # Default text density
+                0.0, # Default RAM
+                0.0  # Default CPU
             ], device=foveal_latent.device)
         elif not isinstance(bio_state, torch.Tensor):
             bio_state = torch.tensor(bio_state, dtype=torch.float32, device=foveal_latent.device)
@@ -322,10 +386,16 @@ class EvolutionaryBrain:
         bio_size = bio_state.shape[0]
         padding_size = self.genome.NON_VISUAL_INPUT_SIZE - (bio_size + 100)
         
+        # Memory Latent (Hippocampus Prediction)
+        if memory_latent is None:
+            # Default to zeros if not provided (e.g. first step)
+            memory_latent = torch.zeros(3 * self.latent_dim, device=foveal_latent.device)
+        
         full_input = torch.cat([
             foveal_latent.flatten(),
             peripheral_latent.flatten(),
             semantic_latent.flatten(),
+            memory_latent.flatten(), # Added Memory Context
             bio_state,
             last_action_vec,
             torch.zeros(max(0, padding_size), device=foveal_latent.device)
@@ -334,42 +404,97 @@ class EvolutionaryBrain:
         return full_input
 
     def wake_cycle(self, reward=0.0, pain=0.0):
-        # 1. Get Latest Vision Data from Retina
-        vision_data = self.retina.get_latest_input()
-        if vision_data is None:
-            return "WAITING_FOR_RETINA"
-            
-        foveal_latent, peripheral_latent, surprise, text_density, fovea_tensor = vision_data
-        
-        # Convert latents to tensors if they are numpy
         device = next(self.trm.parameters()).device
-        if isinstance(foveal_latent, np.ndarray):
-            foveal_latent = torch.from_numpy(foveal_latent).float().to(device)
-        if isinstance(peripheral_latent, np.ndarray):
-            peripheral_latent = torch.from_numpy(peripheral_latent).float().to(device)
-            
-        # 2. Get Semantic Context from Broca
-        semantic_latent = self.broca.get_current_context()
         
-        # 3. Construct Full Input Vector
-        # Bio state includes surprise and text density as "internal senses"
+        # --- THALAMIC GATING SYSTEM (Structural) ---
+        # "The Doors of Perception"
+        # The Thalamus (in NeuromodulatedHolographicBrain) handles the mixing physically.
+        # Here we just prepare the inputs: Reality (Sensory) and Expectation (Memory).
+        
+        # 1. Get Bottom-Up Signal (Reality)
+        vision_data = self.retina.get_latest_input()
+        
+        if vision_data is not None:
+            # Reality is available
+            foveal_latent, peripheral_latent, surprise, text_density, fovea_tensor = vision_data
+            
+            # Convert to tensors
+            if isinstance(foveal_latent, np.ndarray):
+                foveal_latent = torch.from_numpy(foveal_latent).float().to(device)
+            if isinstance(peripheral_latent, np.ndarray):
+                peripheral_latent = torch.from_numpy(peripheral_latent).float().to(device)
+                
+            # Get Semantic Context from Broca
+            semantic_latent = self.broca.get_current_context()
+            
+        else:
+            # Reality is missing (Silence/Dreaming)
+            # We provide ZEROS for the sensory input.
+            # The Thalamus will detect this (and the chemical state) and switch to Memory.
+            foveal_latent = torch.zeros(self.latent_dim, device=device)
+            peripheral_latent = torch.zeros(self.latent_dim, device=device)
+            semantic_latent = torch.zeros(self.latent_dim, device=device)
+            surprise = 0.0
+            text_density = 0.0
+            
+        # 7. Construct Bio State
         bio_state = torch.tensor([
             self.chemistry.dopamine, 
             self.chemistry.serotonin, 
             self.chemistry.norepinephrine, 
             self.stamina,
-            surprise,
-            text_density
+            surprise, 
+            text_density, 
+            0.0, # RAM (Placeholder)
+            0.0  # CPU (Placeholder)
         ], device=device)
+        # --- HIPPOCAMPUS INTEGRATION ---
+        # 1. Construct Sensory State (What we are seeing/thinking NOW)
+        sensory_state = torch.cat([
+            foveal_latent.flatten(),
+            peripheral_latent.flatten(),
+            semantic_latent.flatten()
+        ])
         
-        full_input = self.get_input_vector(foveal_latent, peripheral_latent, semantic_latent, bio_state=bio_state)
+        # 2. Update Memory (Learn from Prediction Error)
+        # "Was my previous prediction correct?"
+        memory_surprise = self.hippocampus.observe(sensory_state)
+        
+        # 3. Predict Next State (Context for Decision)
+        # "What do I expect to happen next?"
+        memory_prediction = self.hippocampus(sensory_state)
+        
+        # Add memory surprise to global surprise
+        surprise += memory_surprise
+        
+        full_input = self.get_input_vector(
+            foveal_latent, 
+            peripheral_latent, 
+            semantic_latent, 
+            bio_state=bio_state,
+            memory_latent=memory_prediction
+        )
         
         # 4. Decide Action
-        action, _ = self.decide(full_input)
+        # Returns: Intent Index (int), Parameter Logits (Tensor)
+        intent_action, param_logits = self.decide(full_input)
         
-        # 5. Execute Action
-        gaze_pos = (self.retina.gaze_x, self.retina.gaze_y)
-        self.cradle.execute_code(action, gaze_pos=gaze_pos)
+        # 5. Execute Action (Distributed)
+        # We pass the parameters (X, Y, etc.) to the cradle
+        # Process Parameters for Execution
+        # X, Y are at indices 0, 1 of param_logits (which corresponds to 10, 11 of original)
+        execution_params = param_logits.clone().detach().squeeze()
+        if execution_params.dim() == 0: execution_params = execution_params.unsqueeze(0)
+        
+        # Apply Sigmoid to X,Y (first 2 params) to ensure 0-1 range
+        if execution_params.shape[0] >= 2:
+            execution_params[0] = torch.sigmoid(execution_params[0])
+            execution_params[1] = torch.sigmoid(execution_params[1])
+            
+        self.cradle.execute_distributed(intent_action, execution_params)
+        
+        # Store for Replay (We store the INTENT as the action)
+        action = intent_action
         
         # 6. Update Replay Buffer (Experience Replay)
         if self.prev_state is not None:
@@ -381,12 +506,18 @@ class EvolutionaryBrain:
         self.prev_reward = reward
         
         # 8. Update chemistry based on effort and sensory feedback
+        # CPU load increases effort/metabolic cost
+        norm_cpu = 0.0
+        metabolic_cost = self.genome.ACTION_COST_BASE + (norm_cpu * 0.05)
+        
         rpe = reward - getattr(self, 'last_value', 0.0)
         self.chemistry.update(
             reward_prediction_error=rpe, 
             surprise=surprise, 
             pain=pain, 
-            effort=self.genome.ACTION_COST_BASE
+            effort=metabolic_cost,
+            fear=self.amygdala.fear_level,
+            aggression=self.amygdala.aggression_level
         )
         
         # 9. Increment Age

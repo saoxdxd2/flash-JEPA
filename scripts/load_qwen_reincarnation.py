@@ -3,10 +3,17 @@ Qwen Reincarnation Loader
 
 Loads the gen_0_qwen_reincarnation.pt created by colab.ipynb
 and converts it to a working Flash-JEPA EvolutionaryBrain.
+
+This module handles the knowledge transfer from a pretrained Qwen model
+to the Flash-JEPA architecture, mapping:
+- Embeddings → Broca's semantic memory
+- Transformer layers → TRM liquid neurons
+- LM head → action decoder
 """
 import torch
 import os
 import sys
+from typing import Optional, Dict, Any
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -14,7 +21,36 @@ from brain.evolutionary_brain import EvolutionaryBrain
 from brain.genome import Genome
 
 
-def load_qwen_reincarnation(reincarnation_path, output_path=None):
+# === CONFIGURATION CONSTANTS ===
+# These control the knowledge transfer from Qwen to Flash-JEPA
+
+# Maximum number of embedding vectors to transfer to Broca's semantic memory
+# (Note: Flash-JEPA uses continuous latent representations, not discrete tokens)
+MAX_EMBEDDING_VECTORS = 10000
+
+# Default hidden size when not specified in checkpoint
+DEFAULT_HIDDEN_SIZE = 4096
+
+# Maximum hidden size for CPU-efficient operation
+MAX_CPU_HIDDEN_SIZE = 4096
+
+# Maximum latent dimension for CPU efficiency
+MAX_CPU_LATENT_DIM = 1024
+
+# Latent divisor for computing latent_dim from hidden_size
+LATENT_DIVISOR = 4
+
+# Projection normalization factor (1/sqrt(n) initialization)
+PROJECTION_NORM_FACTOR = 0.5
+
+# Layer logging interval for progress updates
+LAYER_LOG_INTERVAL = 10
+
+
+def load_qwen_reincarnation(
+    reincarnation_path: str, 
+    output_path: Optional[str] = None
+) -> EvolutionaryBrain:
     """
     Loads a Qwen reincarnation checkpoint and creates a Flash-JEPA brain.
     
@@ -25,10 +61,19 @@ def load_qwen_reincarnation(reincarnation_path, output_path=None):
     Returns:
         EvolutionaryBrain initialized with Qwen's knowledge
     """
+    # Validate input path exists
+    if not os.path.exists(reincarnation_path):
+        raise FileNotFoundError(
+            f"Reincarnation checkpoint not found: {reincarnation_path}"
+        )
+    
     print(f"Loading Qwen reincarnation from {reincarnation_path}...")
     
-    # Load the reincarnation
-    qwen_state = torch.load(reincarnation_path, map_location='cpu')
+    # Load the reincarnation checkpoint
+    try:
+        qwen_state: Dict[str, Any] = torch.load(reincarnation_path, map_location='cpu')
+    except Exception as e:
+        raise RuntimeError(f"Failed to load checkpoint: {e}") from e
     
     version = qwen_state.get('version', 'unknown')
     config = qwen_state.get('config', {})
@@ -36,15 +81,16 @@ def load_qwen_reincarnation(reincarnation_path, output_path=None):
     print(f"Reincarnation version: {version}")
     print(f"Config: {config}")
     
-    # Create genome based on Qwen's architecture
-    vocab_size = config.get('vocab_size', 151936)
-    hidden_size = config.get('hidden_size', 4096)
+    # Extract architecture parameters with sensible defaults
+    vocab_size = config.get('vocab_size', 151936)  # Qwen-2.5 vocab size
+    hidden_size = config.get('hidden_size', DEFAULT_HIDDEN_SIZE)
     num_layers = qwen_state.get('num_layers', 94)
     
+    # Create genome based on Qwen's architecture
     genome = Genome()
-    # Scale genome to match Qwen's capacity
-    genome.hidden_size = min(hidden_size, 4096)  # Cap for CPU
-    genome.latent_dim = min(hidden_size // 4, 1024)
+    # Scale genome to match Qwen's capacity (capped for CPU efficiency)
+    genome.hidden_size = min(hidden_size, MAX_CPU_HIDDEN_SIZE)
+    genome.latent_dim = min(hidden_size // LATENT_DIVISOR, MAX_CPU_LATENT_DIM)
     
     print(f"Creating brain with hidden={genome.hidden_size}, latent={genome.latent_dim}")
     
@@ -59,14 +105,17 @@ def load_qwen_reincarnation(reincarnation_path, output_path=None):
         print(f"Injecting embeddings {embeddings.shape} into Broca...")
         
         # Project to Broca's dimension if needed
+        # Limit embedding vectors to transfer for efficiency
+        embeddings_to_transfer = embeddings[:MAX_EMBEDDING_VECTORS]
+        
         if embeddings.shape[1] > brain.broca.embedding_dim:
-            # Create projection matrix
+            # Create projection matrix with proper initialization
             proj = torch.randn(embeddings.shape[1], brain.broca.embedding_dim)
-            proj = proj / (embeddings.shape[1] ** 0.5)  # Normalize
-            projected = torch.mm(embeddings[:10000], proj)  # Top 10K tokens
+            proj = proj / (embeddings.shape[1] ** PROJECTION_NORM_FACTOR)  # Xavier-like normalization
+            projected = torch.mm(embeddings_to_transfer, proj)
             brain.broca.seed_knowledge(projected)
         else:
-            brain.broca.seed_knowledge(embeddings[:10000])
+            brain.broca.seed_knowledge(embeddings_to_transfer)
     
     # 2. Layers → TRM liquid neurons
     layers = qwen_state.get('layers', [])
@@ -110,7 +159,7 @@ def load_qwen_reincarnation(reincarnation_path, output_path=None):
                         trm_state[key] = tau.flatten()[:target_shape.numel()].reshape(target_shape)
                     break
         
-        if i % 10 == 0:
+        if i % LAYER_LOG_INTERVAL == 0:
             print(f"  Processed layer {i}/{len(layers)}")
     
     # Load modified state

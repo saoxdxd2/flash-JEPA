@@ -2,6 +2,8 @@ import torch
 import psutil
 import os
 
+# === DEVICE MANAGEMENT ===
+
 def get_best_device():
     """
     Returns the most capable torch device available.
@@ -45,3 +47,26 @@ def check_ram_limit(max_ram_mb):
     process = psutil.Process(os.getpid())
     current_mem = process.memory_info().rss / (1024 * 1024)
     return current_mem >= max_ram_mb
+
+# === RESOURCE MONITORING ===
+
+class ResourceMonitor:
+    """
+    Monitors the physical resources used by the agent (Process).
+    Used to calculate biological cost of computing.
+    """
+    def __init__(self):
+        self.process = psutil.Process(os.getpid())
+
+    def get_usage(self):
+        """
+        Returns (ram_mb, cpu_percent).
+        """
+        # RAM in MB
+        ram_bytes = self.process.memory_info().rss
+        ram_mb = ram_bytes / (1024 * 1024)
+        
+        # CPU Percent (interval=None is non-blocking)
+        cpu_percent = self.process.cpu_percent(interval=None)
+        
+        return ram_mb, cpu_percent
