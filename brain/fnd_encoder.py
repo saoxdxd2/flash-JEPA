@@ -33,202 +33,145 @@ class FractalEncoder:
 
     def encode(self, target_weights: torch.Tensor, num_transforms=8, iterations=1000) -> FractalDNA:
         """
-        Compresses a weight matrix into Fractal DNA.
-        
-        Args:
-            target_weights: The matrix to compress (H, W)
-            num_transforms: Number of affine transformations to use (compression ratio determinant)
-            iterations: Optimization steps
-            
-        Returns:
-            FractalDNA object
+        Compresses a single weight matrix into Fractal DNA.
+        Wrapper around encode_batch for single item.
         """
-        target = target_weights.to(self.device).float()
-        H, W = target.shape
+        target_batch = target_weights.unsqueeze(0) # [1, H, W]
+        dna_list = self.encode_batch(target_batch, num_transforms, iterations)
+        return dna_list[0]
+
+    def encode_batch(self, target_batch: torch.Tensor, num_transforms=8, iterations=1000) -> List[FractalDNA]:
+        """
+        Compresses a batch of weight matrices into Fractal DNA.
+        Args:
+            target_batch: [Batch, H, W]
+        """
+        B, H, W = target_batch.shape
+        target = target_batch.to(self.device).float()
         
-        # Normalize target to [0, 1] for fractal processing, keep stats to restore
-        min_val = target.min()
-        max_val = target.max()
-        scale = max_val - min_val
-        if scale == 0: scale = 1.0
+        # Normalize each item in batch independently
+        # min_vals: [B, 1, 1]
+        min_vals = target.amin(dim=(1, 2), keepdim=True)
+        max_vals = target.amax(dim=(1, 2), keepdim=True)
+        scales = max_vals - min_vals
+        scales[scales == 0] = 1.0
         
-        normalized_target = (target - min_val) / scale
+        normalized_target = (target - min_vals) / scales
         
-        # Initialize Affine Transforms (a, b, c, d, e, f)
-        # x' = ax + by + e
-        # y' = cx + dy + f
-        # We optimize these parameters to minimize the Collage Distance
-        
-        # Parameters: [num_transforms, 6]
+        # Parameters: [B, num_transforms, 6]
         # We use a neural network approach to optimize the parameters
-        params = torch.randn(num_transforms, 6, device=self.device, requires_grad=True)
-        # Probabilities: [num_transforms]
-        probs_logits = torch.randn(num_transforms, device=self.device, requires_grad=True)
+        params = torch.randn(B, num_transforms, 6, device=self.device, requires_grad=True)
+        # Probabilities: [B, num_transforms]
+        probs_logits = torch.randn(B, num_transforms, device=self.device, requires_grad=True)
         
         optimizer = torch.optim.Adam([params, probs_logits], lr=0.01)
         
-        print(f"FractalEncoder: Compressing {H}x{W} matrix using {num_transforms} transforms...")
+        # print(f"FractalEncoder: Compressing Batch of {B} matrices ({H}x{W}) using {num_transforms} transforms...")
         start_time = time.time()
         
         for i in range(iterations):
             optimizer.zero_grad()
             
-            # Collage Error Calculation
-            # Instead of full rendering (which is non-differentiable/hard), 
-            # we minimize the distance between the target and the union of transformed copies of the target.
-            # Collage Theorem: d(T, W) < (1/(1-s)) * d(T, Union(w_i(T)))
-            
-            # 1. Apply transforms to the target image (grid sample)
-            # We treat the matrix as an image
-            reconstructed = torch.zeros_like(normalized_target)
-            
-            # Create grid for affine_grid
-            # PyTorch affine_grid expects [N, 2, 3] matrix for 2D
-            # params is [N, 6] -> reshape to [N, 2, 3]
-            
-            # We need to iterate over transforms and sum them weighted by probability?
-            # Standard IFS is a union. For grayscale/weights, it's a weighted sum or max.
-            # Let's use weighted sum approximation for differentiability.
-            
-            probs = torch.softmax(probs_logits, dim=0)
-            
-            total_loss = 0
-            
-            # This is a simplified "Collage Loss":
-            # The target should be a fixed point of the operator T(x) = sum(p_i * w_i(x))
-            # So we want T(target) approx target.
-            
-            # Memory Optimization: Monte Carlo Sampling (Stochastic)
-            # Instead of processing the full HxW grid, we sample random points.
-            # This makes memory usage independent of image size.
-            
-            num_samples = 100000 # Sample 100k points per step (tunable)
+            # Monte Carlo Sampling
+            num_samples = 100000 
             
             # Generate random coordinates in [-1, 1]
-            # shape: [1, num_samples, 1, 2] for grid_sample
+            # shape: [1, num_samples, 1, 2] -> Shared across batch for efficiency
             sample_coords = torch.rand(1, num_samples, 1, 2, device=self.device) * 2 - 2
             
-            # Sample target at these coordinates
-            # target_batch: [1, 1, H, W]
-            target_batch = normalized_target.unsqueeze(0).unsqueeze(0)
-            target_samples = torch.nn.functional.grid_sample(target_batch, sample_coords, align_corners=False)
+            # Sample targets
+            # target_batch: [B, 1, H, W] (unsqueeze channel)
+            target_input = normalized_target.unsqueeze(1)
+            # sample_coords expanded: [B, num_samples, 1, 2]
+            sample_coords_expanded = sample_coords.expand(B, -1, -1, -1)
             
-            # Accumulate weighted sum at these coordinates
-            reconstructed_samples = torch.zeros_like(target_samples)
-            probs = torch.softmax(probs_logits, dim=0)
+            target_samples = torch.nn.functional.grid_sample(target_input, sample_coords_expanded, align_corners=False)
+            # target_samples: [B, 1, N, 1]
             
-            theta_all = params.view(num_transforms, 2, 3)
+            # Accumulate weighted sum
+            # reconstructed_samples = torch.zeros_like(target_samples)
+            probs = torch.softmax(probs_logits, dim=1) # [B, T]
             
-            # We can process all transforms for these samples because num_samples is small
-            # But let's keep chunking just in case num_samples is large
-            chunk_size = 4
+            theta_all = params.view(B, num_transforms, 2, 3)
             
-            for t_idx in range(0, num_transforms, chunk_size):
-                end_idx = min(t_idx + chunk_size, num_transforms)
-                current_batch_size = end_idx - t_idx
-                
-                theta_chunk = theta_all[t_idx:end_idx]
-                
-                # We need to apply affine transform to the coordinates 'sample_coords'
-                # affine_grid generates a grid from theta.
-                # Here we have explicit points.
-                # We can use affine_grid if we treat sample_coords as a "mesh" but that's complex.
-                # Easier: Manual affine transform of coordinates.
-                # Coords: [1, N, 1, 2] -> [N, 2]
-                # Theta: [T, 2, 3]
-                
-                # Let's use grid_sample with a trick.
-                # If we want T(x), we can't easily use grid_sample to *move* points.
-                # grid_sample(img, grid) samples img at grid.
-                # If grid = T(coords), then we are sampling img at T(coords).
-                # This is exactly what we want for the Collage Theorem term w_i(T).
-                
-                # We need to generate 'grid' which is the transformed coordinates.
-                # PyTorch affine_grid generates a regular grid. We have irregular points.
-                # We must manually multiply.
-                
-                # coords: [1, N, 1, 2] -> [N, 3] (homogeneous)
-                coords_flat = sample_coords.view(-1, 2)
-                N = coords_flat.shape[0]
-                ones = torch.ones(N, 1, device=self.device)
-                coords_homo = torch.cat([coords_flat, ones], dim=1) # [N, 3]
-                
-                # theta_chunk: [T, 2, 3]
-                # We want output: [T, N, 2]
-                # result = coords_homo @ theta_chunk.T ?
-                # theta: 2x3. coords: Nx3.
-                # result = coords @ theta.T -> Nx2.
-                
-                # Batch matmul:
-                # coords_homo: [1, N, 3]
-                # theta_chunk: [T, 2, 3] -> [T, 3, 2] (transpose last 2)
-                
-                # We want for each T, result = coords @ theta.T
-                # [T, N, 2] = [1, N, 3] @ [T, 3, 2] ? No.
-                
-                # Let's loop or expand.
-                # coords_homo_expanded: [T, N, 3]
-                coords_homo_expanded = coords_homo.unsqueeze(0).expand(current_batch_size, -1, -1)
-                
-                # theta_chunk_transposed: [T, 3, 2]
-                theta_chunk_T = theta_chunk.transpose(1, 2)
-                
-                # transformed_coords: [T, N, 2]
-                transformed_coords = torch.bmm(coords_homo_expanded, theta_chunk_T)
-                
-                # Reshape for grid_sample: [T, N, 1, 2]
-                grid = transformed_coords.view(current_batch_size, num_samples, 1, 2)
-                
-                # Sample target at transformed coords
-                # target_batch expanded: [T, 1, H, W]
-                target_batch_expanded = target_batch.expand(current_batch_size, -1, -1, -1)
-                
-                # samples: [T, 1, N, 1]
-                samples = torch.nn.functional.grid_sample(target_batch_expanded, grid, align_corners=False)
-                
-                # Accumulate
-                # samples: [T, 1, N, 1]
-                # probs: [T]
-                chunk_probs = probs[t_idx:end_idx].view(-1, 1, 1, 1)
-                
-                # Sum over T dimension
-                weighted_chunk_sum = torch.sum(samples * chunk_probs, dim=0) # [1, N, 1]
-                
-                reconstructed_samples = reconstructed_samples + weighted_chunk_sum
-                
-            loss = torch.nn.functional.mse_loss(reconstructed_samples, target_samples)
+            # Process transforms
+            # We can process all transforms in parallel if memory allows.
+            # B*T*N*2 floats. 
+            
+            # coords_homo: [1, N, 3]
+            coords_flat = sample_coords.view(1, num_samples, 2)
+            ones = torch.ones(1, num_samples, 1, device=self.device)
+            coords_homo = torch.cat([coords_flat, ones], dim=2) # [1, N, 3]
+            
+            # Expand coords for Batch and Transforms
+            # We want [B, T, N, 3]
+            coords_expanded = coords_homo.unsqueeze(1).expand(B, num_transforms, -1, -1) # [B, T, N, 3]
+            
+            # Theta: [B, T, 2, 3] -> Transpose to [B, T, 3, 2]
+            theta_T = theta_all.transpose(2, 3)
+            
+            # Matmul: [B, T, N, 3] @ [B, T, 3, 2] -> [B, T, N, 2]
+            transformed_coords = torch.matmul(coords_expanded, theta_T)
+            
+            # Reshape for grid_sample
+            # We need to sample from target_input [B, 1, H, W]
+            # But we have T grids per batch item.
+            # We can fold B*T into batch dim?
+            # target_input expanded: [B*T, 1, H, W]
+            target_folded = target_input.repeat_interleave(num_transforms, dim=0)
+            
+            # grid folded: [B*T, N, 1, 2]
+            grid_folded = transformed_coords.view(B * num_transforms, num_samples, 1, 2)
+            
+            # Sample
+            samples_folded = torch.nn.functional.grid_sample(target_folded, grid_folded, align_corners=False)
+            # samples_folded: [B*T, 1, N, 1]
+            
+            # Unfold
+            samples = samples_folded.view(B, num_transforms, 1, num_samples, 1)
+            
+            # Weighting
+            # probs: [B, T] -> [B, T, 1, 1, 1]
+            probs_expanded = probs.view(B, num_transforms, 1, 1, 1)
+            
+            # Sum over T
+            weighted_sum = torch.sum(samples * probs_expanded, dim=1) # [B, 1, N, 1]
+            
+            loss = torch.nn.functional.mse_loss(weighted_sum, target_samples)
             
             loss.backward()
             optimizer.step()
             
-            # Early Stopping
-            if loss.item() < 0.001: # Sufficiently accurate
-                if i % 50 == 0: print(f"  Step {i}: Loss {loss.item():.6f} (Early Stop)")
-                break
-            
-            if i % 100 == 0:
-                print(f"  Step {i}: Loss {loss.item():.6f}")
+            if i % 50 == 0:
+                # Check max loss in batch? Or mean?
+                # Optimization minimizes mean loss over batch.
+                if loss.item() < 0.001:
+                     # print(f"  Step {i}: Loss {loss.item():.6f} (Early Stop)")
+                     break
+                # print(f"  Step {i}: Loss {loss.item():.6f}")
                 
-        print(f"FractalEncoder: Compression Complete. Final Loss: {loss.item():.6f} ({time.time() - start_time:.2f}s)")
+        # print(f"FractalEncoder: Batch Compression Complete. Final Loss: {loss.item():.6f} ({time.time() - start_time:.2f}s)")
         
-        # Pack into DNA
-        transforms_list = []
+        # Pack results
+        dna_list = []
         final_params = params.detach().cpu().numpy()
-        final_probs = torch.softmax(probs_logits, dim=0).detach().cpu().numpy()
+        final_probs = probs.detach().cpu().numpy()
+        min_vals_cpu = min_vals.detach().cpu().numpy().flatten()
         
-        for idx in range(num_transforms):
-            p = final_params[idx]
-            transforms_list.append({
-                'a': float(p[0]), 'b': float(p[1]), 'e': float(p[4]),
-                'c': float(p[2]), 'd': float(p[3]), 'f': float(p[5]),
-                'p': float(final_probs[idx])
-            })
+        for b in range(B):
+            transforms_list = []
+            for idx in range(num_transforms):
+                p = final_params[b, idx]
+                transforms_list.append({
+                    'a': float(p[0]), 'b': float(p[1]), 'e': float(p[4]),
+                    'c': float(p[2]), 'd': float(p[3]), 'f': float(p[5]),
+                    'p': float(final_probs[b, idx])
+                })
             
-        return FractalDNA(
-            shape=(H, W),
-            transforms=transforms_list,
-            base_value=float(min_val.item()) # We store min/scale implicitly or explicitly? 
-            # Actually, we need to store min and scale to reconstruct exact values.
-            # Let's store min_val and scale in base_value for now (tuple hack or just min)
-            # Simplified: just base_value = min, and we assume we need to store scale too.
-        )
+            dna_list.append(FractalDNA(
+                shape=(H, W),
+                transforms=transforms_list,
+                base_value=float(min_vals_cpu[b]) 
+            ))
+            
+        return dna_list
