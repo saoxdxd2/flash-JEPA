@@ -97,7 +97,12 @@ class EvolutionaryBrain:
             nn.Linear(2048, self.latent_dim)
         ).to(self.device)
         
-        # --- 9. Optimizers ---
+        # --- 9. Fractal Cortex (The Vessel's New Brain) ---
+        # Loads the compressed Qwen-3 DNA if available
+        from brain.modules.fractal_brain import FractalBrain
+        self.cortex = FractalBrain(dna_path="models/fractal_brain.pt", device=self.device)
+        
+        # --- 10. Optimizers ---
         self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate * 2.0)
         
         # --- Interface (Cradle) ---

@@ -201,6 +201,11 @@ class FractalEncoder:
             loss.backward()
             optimizer.step()
             
+            # Early Stopping
+            if loss.item() < 0.001: # Sufficiently accurate
+                if i % 50 == 0: print(f"  Step {i}: Loss {loss.item():.6f} (Early Stop)")
+                break
+            
             if i % 100 == 0:
                 print(f"  Step {i}: Loss {loss.item():.6f}")
                 

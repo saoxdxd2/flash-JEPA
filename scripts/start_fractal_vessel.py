@@ -83,61 +83,6 @@ def compress_qwen_to_fractal_dna():
                 full_shard_path = os.path.join(root, shard_file)
                 break
                 
-        if not full_shard_path:
-            print(f"Could not find downloaded file for {shard_file}")
-            continue
-            
-        print(f"Compressing layers in {shard_file}...")
-        
-        with safe_open(full_shard_path, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                # We only compress weight matrices (2D)
-                # Skip biases or 1D tensors for now (store them raw or ignore?)
-                # For 1:1000, we must compress everything.
-                # But biases are small. Let's store biases raw and compress weights.
-                
-                tensor = f.get_tensor(key)
-                
-                if len(tensor.shape) < 2:
-                    # Store 1D tensors (biases, layernorms) raw
-                    # They are negligible compared to 235B weights
-                    fractal_brain[key] = tensor.cpu()
-                    total_params += tensor.nelement()
-                    compressed_params += tensor.nelement()
-                    continue
-                    
-                # Compress 2D Weights
-                print(f"  Encoding {key} {tensor.shape}...")
-                
-                # Check if it's a massive matrix, might need chunking?
-                # FractalEncoder handles it, but optimization time scales.
-                
-                # Encode!
-                # Use fewer transforms for less important layers?
-                # For now, standard 16 transforms.
-                dna = encoder.encode(tensor, num_transforms=16, iterations=200)
-                
-                # Store DNA
-                fractal_brain[key] = dna.to_json()
-                
-                # Stats
-                orig_count = tensor.nelement()
-                # 16 transforms * 7 params
-                comp_count = 16 * 7 
-                
-                total_params += orig_count
-                compressed_params += comp_count
-                
-                # Memory Cleanup
-                del tensor
-                del dna
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-        # Clean up shard to free disk/ram?
-        # Colab has disk space, but we should be careful.
-        # os.remove(full_shard_path) # Optional
-        
     # 4. Save Final DNA
     print("\n=== Compression Complete ===")
     print(f"Total Original Parameters: {total_params:,}")
