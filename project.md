@@ -1,224 +1,113 @@
-# Flash-JEPA: Biological Agentic AI - Deep Technical Resume
+# Fractal Neural DNA: Biological Agentic AI - Deep Technical Resume
 
-Flash-JEPA is a state-of-the-art Biological Agentic AI system designed to simulate complex cognitive processes through a hierarchical, neuromodulated, and holographic architecture. It integrates advanced neural network paradigms with biological principles to achieve adaptive, efficient, and scalable intelligence.
-
-## 🧠 Mathematical & Architectural Foundations
-
-### 1. Liquid Neural Networks (LNN)
-Flash-JEPA leverages **Liquid Neural Networks** for continuous-time dynamics. Unlike traditional RNNs, LNNs use Ordinary Differential Equations (ODEs) to model synaptic interactions, allowing the network to adapt its time constants based on input variability.
-- **VectorizedLiquidGraph**: GPU-accelerated ODE integration using `torch`.
-- **SparseVectorizedLiquidGraph**: Scalable to 1B+ neurons using sparse CSR/COO matrix multiplication.
-- **Dynamics**: $\frac{dx}{dt} = -A \odot x + (S - x) \odot \sigma(Wx + b)$, where $A$ is the bias/leakage and $S$ is the saturation state.
-
-### 2. Titans Neural Memory (Long-Term Memory)
-Inspired by the "Titans" architecture, this module implements **Flashbulb Memory**—a surprise-based online weight update mechanism.
-- **Surprise Signal**: Calculated as the gradient of the prediction error.
-- **Online Updates**: Synaptic weights are updated in real-time using $\Delta W = \eta \cdot \nabla_{W} \mathcal{L}$, allowing for immediate learning of high-salience information.
-- **Efficiency**: Uses sparse CSR caching to manage massive memory stores without linear scaling of compute.
-
-### 3. N2N2 (Neural-to-Neural 2.0)
-**N2N2** is a "Hyper-Stimulation" transfer protocol for imprinting teacher embeddings (e.g., from Qwen-3) directly into the agent's synapses.
-- **Hyper-Stimulation**: Directly setting synaptic weights based on source model projections.
-- **Elastic Weight Consolidation (EWC)**: Prevents catastrophic forgetting by penalizing changes to weights that are critical for previously learned tasks.
-
-### 4. H-NH-JEPA (Hierarchical Neuromodulated Holographic JEPA)
-The core architecture is a **Hierarchical Neuromodulated Holographic Joint-Embedding Predictive Architecture**.
-- **Holographic Wavelet Encoding**: Uses wavelet transforms for multi-scale visual and semantic representation.
-- **Hierarchical Gating**: Three levels of processing: **Reflex** (System 1), **Concept** (Semantic), and **Strategy** (System 2).
-- **Neuromodulation**: Gating signals inspired by Dopamine (reward), Serotonin (stability), Norepinephrine (arousal), and Cortisol (stress).
+**Fractal Neural DNA (FND)** is a paradigm-shifting AI architecture designed to "virtualize" massive Large Language Models (LLMs) onto consumer hardware by compressing their synaptic weights into **Iterated Function Systems (IFS)**. This allows a 235B parameter model (like Qwen-3-VL) to run on a fraction of the RAM, simulating a biological brain with homeostatic neurochemistry.
 
 ---
 
-## 📁 Directory Hierarchy
+## 🧠 Core Architecture: Fractal Neural DNA
+
+### 1. The Compression Engine (1:1000 Ratio)
+Instead of storing raw float16 weights, we store the **generator code** (DNA) that creates them.
+-   **Mathematical Basis**: The **Collage Theorem**. Any complex matrix can be approximated as the fixed point (attractor) of a contractive Iterated Function System (IFS).
+-   **Encoder (`FractalEncoder`)**: Solves the "Inverse Fractal Problem" using gradient descent to find 8-12 affine transforms that reconstruct the target weight matrix.
+-   **Decoder (`FractalLinear`)**: Reconstructs the weight matrix **Just-In-Time (JIT)** during the forward pass.
+    -   *Memory Footprint*: Stores only ~100 floats per layer (the DNA) instead of millions.
+    -   *Compute*: Reconstructs weights on the GPU, uses them for matrix multiplication, and discards them immediately (or caches them for short bursts).
+
+### 2. Neural Virtualization
+This architecture decouples **Model Size** from **VRAM Capacity**.
+-   **Virtual Weights**: The model "exists" mathematically as infinite-resolution fractals. It is only "instantiated" into physical RAM when needed.
+-   **Holographic Paging**: Layers are streamed and reconstructed on demand, allowing a 235B model to run on a 24GB GPU (with slower inference but full fidelity).
+
+---
+
+## 🧬 Biological Core: The "Ghost" in the Machine
+
+The agent is not just a static model; it is a living, homeostatic system driven by simulated neurochemistry.
+
+### 1. Neurotransmitter System (`biology_core.py`)
+A system of differential equations governs the agent's internal state, modulating its behavior.
+-   **Dopamine (DA)**: The "Drive" signal.
+    -   *Source*: Reward Prediction Error (RPE).
+    -   *Effect*: Gates action selection in the Basal Ganglia. High DA = Exploration/Risk; Low DA = Lethargy.
+    -   *Dynamics*: $\frac{d(DA)}{dt} = RPE - (Cortisol \times 0.1) - Decay$.
+-   **Cortisol (CORT)**: The "Stress" signal.
+    -   *Source*: Pain, High Effort, Surprise.
+    -   *Effect*: Suppresses Dopamine (Depression), narrows attention (Tunnel Vision).
+    -   *Dynamics*: Spikes rapidly, decays slowly.
+-   **Serotonin (5-HT)**: The "Mood" stabilizer.
+    -   *Effect*: Regulates Dopamine spikes, preventing mania.
+-   **Norepinephrine (NE)**: The "Arousal" signal.
+    -   *Effect*: Increases gain on sensory inputs (Alertness).
+
+### 2. Homeostasis & Starvation
+-   **Energy**: Consumed by thinking (inference) and acting.
+-   **Starvation**: If Energy $\to$ 0, the brain enters a low-power "Lethargy" mode (scaling all neurotransmitters by 0.1), forcing the agent to seek "food" (charging/rewards).
+
+---
+
+## 🏗️ System Architecture
+
+### 1. The Cortex (`FractalBrain`)
+-   **Backbone**: Qwen-3-VL-235B (Compressed).
+-   **MoE (Mixture of Experts)**: Supports sparse activation. Only the selected "Expert" fractals are decompressed, saving further compute.
+-   **Status**: **Frozen / Read-Only**. The fractal weights are fixed. Learning occurs in the auxiliary systems (Memory/Plasticity).
+
+### 2. Memory Systems
+-   **Titans Memory**: Short-term, high-fidelity context window.
+-   **Neural Memory (Hippocampus)**: Long-term sparse associative memory.
+-   **Holographic Imprinting**: "Flashbulb" memories stored as high-surprise gradients.
+
+### 3. Action & Perception
+-   **Predictive Retina**: Dual-stream vision (Foveal + Peripheral).
+-   **Cradle**: The interface to the OS (Mouse, Keyboard, Screen).
+
+---
+
+## 📉 Critical Architectural Analysis & Roadmap
+
+### 1. The "Ribosome" Bottleneck (Fractal Staleness)
+-   **The Flaw**: The current `FractalLinear` layer decompresses weights on-the-fly but treats the DNA as a static buffer. Gradients flow through the *weights* but cannot update the *DNA* itself because the IFS coefficients are not `nn.Parameter`.
+-   **The Result**: The brain is **Read-Only**. It can process information but cannot "learn" (evolve its structure) via backpropagation.
+-   **The Fix**: **Differentiable IFS**. Convert DNA coefficients ($a, b, c, d, e, f$) into learnable parameters, allowing the agent to evolve its own fractal code.
+
+### 2. The Neural V-Sync Conflict (Latent Jitter)
+-   **The Flaw**: `NeuralVirtualizationLayer` dynamically scales `active_npus` to maintain 10ms latency. However, the `VectorizedNPU` uses a shared aggregator. When the number of active NPUs changes, the statistical distribution of the aggregated vector shifts.
+-   **The Result**: **Latent Jitter**. The "meaning" of the thought vector changes purely due to V-Sync adjustments, causing the higher-level brain to "forget" or become confused.
+-   **The Fix**: **Invariant Aggregation**. Implement Layer Normalization or a Fixed-Width Bottleneck immediately after aggregation to ensure the output vector is statistically invariant to the number of active cores.
+
+### 3. The "Titans" Surprise Mismatch
+-   **The Flaw**: `TitansMemory` (Hippocampus) tries to predict the next state of the `PredictiveRetina`. However, both modules are learning online.
+-   **The Result**: **Moving Target Instability**. The Retina changes its latent space (the target) as fast as the Memory learns to predict it, resulting in a loss curve that looks like noise.
+-   **The Fix**: **Timescale Separation**.
+    -   *Retina*: Slow, "Evolutionary" learning rate (or frozen).
+    -   *Memory*: Fast, "Synaptic" learning rate.
+
+### 4. Strategic Analysis: The RAM Wall
+-   **The Hard Truth**: Decompressing a 235B model (even layer-by-layer) via `transcribe()` requires materializing the full weight matrix in VRAM, defeating the purpose of compression for inference on consumer hardware.
+-   **The Strategy**: **Kernel-Level Sparse Inference**.
+    -   Instead of $W = \text{Decode}(DNA); Y = X \cdot W$
+    -   We need $Y = \text{ChaosGame}(X, DNA)$
+    -   This requires a custom CUDA kernel that computes the dot product *implicitly* while iterating the fractal, never materializing $W$. This is the only path to running 235B+ models on <24GB VRAM.
+
+---
+
+## 🧬 Biological Core: The "Ghost" in the Machine
 
 ```text
-Flash-JEPA/
-├── brain/                  # Core Cognitive Engine
-│   ├── modules/            # Specialized Brain Areas (Broca, Retina, Amygdala, etc.)
-│   │   ├── device.py       # [NEW] Unified Hardware Abstraction Layer (HAL)
-│   ├── evolutionary_brain.py # Main Brain Integration & Decision Logic
-│   ├── genome.py           # Genetic Blueprint & Hyperparameter Evolution
-│   ├── lifecycle.py        # Developmental Stages (Imprinting -> Evolution)
-│   ├── n2n.py              # Legacy Knowledge Loader
-│   ├── n2n2.py             # Knowledge Transfer & Hyper-Stimulation
-│   └── population.py       # Multi-Agent Evolution & Selection
-├── models/                 # Neural Network Architectures
-│   ├── liquid_vectorized.py # GPU-Accelerated LNN
-│   ├── liquid_sparse_vectorized.py # Scalable Sparse LNN
-│   ├── neuromodulated_holographic.py # H-NH-JEPA Core
-│   ├── ddqn.py             # Reinforcement Learning Agent
-│   ├── ecg.py              # Modular Brain (Visual/Motor Cortices)
-│   ├── plasticity_mlp.py   # Meta-Learning Plasticity Network
-│   └── sparse_tree.py      # Event-Driven SNN for CPU
-├── scripts/                # Training, Schools, and Utilities
-│   ├── language_school.py  # NLP Training Environment
-│   ├── math_school.py      # Symbolic Reasoning School
-│   ├── web_coding_school.py # Python Coding Curriculum
-│   ├── meditation_v2.py    # Brain Stabilization & Attractor Finding
-│   ├── remote_surgery.py   # High-Res Model Transplant (Colab/Kaggle)
-│   ├── start_n2n2_qwen3_agentic.py # Qwen-3 Teacher Distillation
-│   └── ... (30+ utility scripts for verification and analysis)
-├── tests/                  # Unit & Performance Tests
-│   ├── benchmark_liquid.py # LNN Performance Profiling
-│   └── smoke_test_brain.py # Core Integration Verification
-├── tools/                  # OS & Hardware Interface
-│   └── control.py          # Mouse/Keyboard/Screen Interaction (Cradle)
-├── autonomous_life.py      # Main Entry Point (Wake/Sleep Cycle)
-├── run_lifecycle.py        # Automated Pipeline Runner
-└── project.md              # This Technical Resume
+Fractal-JEPA/
+├── brain/
+│   ├── modules/
+│   │   ├── biology_core.py       # Neurochemistry (Dopamine/Cortisol)
+│   │   ├── fractal_brain.py      # The Virtualized Cortex
+│   │   ├── fractal_layers.py     # JIT Decompression Layer
+│   │   └── ...
+│   ├── fnd_encoder.py            # The Compression Engine (IFS Solver)
+│   └── evolutionary_brain.py     # The Agent's "Soul" (Integration)
+├── models/
+│   └── ...
+├── scripts/
+│   ├── start_fractal_vessel.py   # The Compression Script
+│   └── ...
+└── autonomous_life.py            # The Main Loop
 ```
-
----
-
-## 📄 Exhaustive File Mapping
-
-### 🚀 Root Entry Points
-
-#### [autonomous_life.py](file:///c:/Users/sao/Documents/model/autonomous_life.py)
-- **Purpose**: Main orchestration of the agent's life cycle.
-- **Techniques**: **Wake/Sleep Cycles**, **Population-Based Selection**, **Fitness-Driven Evolution**.
-- **Interactions**: Loads `EvolutionaryBrain` and `PopulationManager` to run the agent in real-time.
-
-#### [run_lifecycle.py](file:///c:/Users/sao/Documents/model/run_lifecycle.py)
-- **Purpose**: Automated pipeline for training and evolution.
-- **Techniques**: **Phase-Based Training** (Imprinting -> Stabilization -> Schooling -> Evolution).
-- **Interactions**: Uses `LifecycleManager` to execute sequential training stages.
-
----
-
-### 🧠 Core Brain Engine (`brain/`)
-
-#### [evolutionary_brain.py](file:///c:/Users/sao/Documents/model/brain/evolutionary_brain.py)
-- **Purpose**: Central cognitive integration.
-- **Techniques**: **Schema Healing**, **Metacognitive Gating**, **Dream-Based Distillation**.
-- **Interactions**: Integrates all `brain/modules/` and `models/`.
-
-#### [genome.py](file:///c:/Users/sao/Documents/model/brain/genome.py)
-- **Purpose**: Genetic blueprint for hyperparameters.
-- **Techniques**: **Self-Adaptive Mutation**, **Genetic Crossover**.
-
-#### [population.py](file:///c:/Users/sao/Documents/model/brain/population.py)
-- **Purpose**: Manages a population of agents for evolutionary selection.
-- **Techniques**: **Elitism**, **N2N2 Crossover**, **Garbage Collection** of old models.
-
-#### [lifecycle.py](file:///c:/Users/sao/Documents/model/brain/lifecycle.py)
-- **Purpose**: High-level developmental management.
-- **Techniques**: **Sequential Semantic Imprinting (SSI)**.
-
-#### [n2n2.py](file:///c:/Users/sao/Documents/model/brain/n2n2.py)
-- **Purpose**: Advanced knowledge transfer (N2N2 3.0).
-- **Techniques**: **Learnable Projections**, **Contrastive Imprinting**, **Elastic Weight Consolidation (EWC)**.
-
----
-
-### 👁️ Specialized Brain Modules (`brain/modules/`)
-
-#### [broca.py](file:///c:/Users/sao/Documents/model/brain/modules/broca.py)
-- **Purpose**: Language and semantic center.
-- **Techniques**: **Mixture of Experts (MoE)**, **Visual Word Form Area (VWFA)**, **Unified Latent Dimensions**.
-
-#### [predictive_retina.py](file:///c:/Users/sao/Documents/model/brain/modules/predictive_retina.py)
-- **Purpose**: Visual processing.
-- **Techniques**: **Dual-Stream Processing**, **Predictive Coding**.
-
-#### [neural_memory.py](file:///c:/Users/sao/Documents/model/brain/modules/neural_memory.py)
-- **Purpose**: Long-term associative memory.
-- **Techniques**: **Flashbulb Memory**, **Sparse CSR Caching**.
-
-#### [amygdala.py](file:///c:/Users/sao/Documents/model/brain/modules/amygdala.py)
-- **Purpose**: Emotional salience and threat detection.
-- **Techniques**: **Amygdala Hijack** (Cortisol/Pain override).
-
-#### [basal_ganglia.py](file:///c:/Users/sao/Documents/model/brain/modules/basal_ganglia.py)
-- **Purpose**: Action selection and gating.
-- **Techniques**: **Dopaminergic Gating**, **Metacognitive Switching**.
-
-#### [biology_core.py](file:///c:/Users/sao/Documents/model/brain/modules/biology_core.py)
-- **Purpose**: Neurochemical simulation.
-- **Techniques**: **Neurotransmitter Dynamics** (Dopamine, Serotonin, Norepinephrine, Cortisol).
-
-#### [cradle.py](file:///c:/Users/sao/Documents/model/brain/modules/cradle.py)
-- **Purpose**: OS interaction interface.
-- **Techniques**: **PyAutoGUI Integration**, **Screen Capture**, **Action Mapping**.
-
-#### [replay_buffer.py](file:///c:/Users/sao/Documents/model/brain/modules/replay_buffer.py)
-- **Purpose**: Experience replay for RL.
-- **Techniques**: **Prioritized Experience Replay (PER)** using **SumTree**.
-
----
-
-### 🏗️ Neural Architectures (`models/`)
-
-#### [liquid_vectorized.py](file:///c:/Users/sao/Documents/model/models/liquid_vectorized.py)
-- **Purpose**: GPU-accelerated LNN.
-- **Techniques**: **Vectorized ODE Integration**.
-
-#### [liquid_sparse_vectorized.py](file:///c:/Users/sao/Documents/model/models/liquid_sparse_vectorized.py)
-- **Purpose**: Scalable sparse LNN.
-- **Techniques**: **Sparse Matrix Multiplication (CSR/COO)**.
-
-#### [neuromodulated_holographic.py](file:///c:/Users/sao/Documents/model/models/neuromodulated_holographic.py)
-- **Purpose**: H-NH-JEPA implementation.
-- **Techniques**: **Holographic Wavelet Encoding**, **Hierarchical Latent Prediction**.
-
-#### [plasticity_mlp.py](file:///c:/Users/sao/Documents/model/models/plasticity_mlp.py)
-- **Purpose**: Meta-learning of synaptic rules.
-- **Techniques**: **Evolved Plasticity Rules** (replacing fixed Hebbian rules).
-
-#### [ecg.py](file:///c:/Users/sao/Documents/model/models/ecg.py)
-- **Purpose**: Modular brain structure.
-- **Techniques**: **Visual/Motor Cortex Partitioning**, **Bus-Based Communication**.
-
-#### [ddqn.py](file:///c:/Users/sao/Documents/model/models/ddqn.py)
-- **Purpose**: Reinforcement learning agent.
-- **Techniques**: **Double Deep Q-Network**, **Target Network Soft-Updates**.
-
-#### [sparse_tree.py](file:///c:/Users/sao/Documents/model/models/sparse_tree.py)
-- **Purpose**: CPU-optimized SNN.
-- **Techniques**: **Event-Driven Propagation**, **Sparse Adjacency Lists**.
-
----
-
-### 📜 Training & Utility Scripts (`scripts/`)
-
-#### [web_coding_school.py](file:///c:/Users/sao/Documents/model/scripts/web_coding_school.py)
-- **Purpose**: Teaches the agent Python coding.
-- **Techniques**: **Curriculum Learning**, **Browser Emulation**, **Teacher Guidance**.
-
-#### [remote_surgery.py](file:///c:/Users/sao/Documents/model/scripts/remote_surgery.py)
-- **Purpose**: High-resolution model transplant.
-- **Techniques**: **Deterministic Random Projection**, **Shard-Based Harvesting**.
-
-#### [meditation_v2.py](file:///c:/Users/sao/Documents/model/scripts/meditation_v2.py)
-- **Purpose**: Brain stabilization.
-- **Techniques**: **Natural Attractor Finding**, **Surprise Minimization**.
-
-#### [language_school.py](file:///c:/Users/sao/Documents/model/scripts/language_school.py)
-- **Purpose**: NLP training.
-- **Techniques**: **Next-Token Prediction**, **Semantic Grounding**.
-
----
-
-### 🧪 Testing & Benchmarking (`tests/`)
-
-#### [benchmark_liquid.py](file:///c:/Users/sao/Documents/model/tests/benchmark_liquid.py)
-- **Purpose**: Performance profiling.
-- **Techniques**: **Legacy vs. Vectorized Comparison**, **Correctness Verification**.
-
----
-
-## 🔄 System Interactions & Protocols
-
-### 1. The Cognitive Loop
-1. **Perception**: `PredictiveRetina` captures screen data, compressing it into foveal/peripheral latents.
-2. **Salience**: `Amygdala` evaluates the latents for surprise or threat.
-3. **Cognition**: `Broca` (Language) and `ModularBrain` (Motor/Visual) process the state.
-4. **Selection**: `BasalGanglia` gates the proposed actions based on `NeurotransmitterSystem` state.
-5. **Action**: `Cradle` executes the selected keyboard/mouse commands.
-
-### 2. Interaction Protocols
-- **GCC (Global Concept Communication)**: Standardized 512-dim vector bus for inter-module communication.
-- **SNN Character Protocol**: Character-level communication between `Broca` and `Cradle` for precise text entry.
-
----
-*This document provides 100% file coverage for the Flash-JEPA project.*

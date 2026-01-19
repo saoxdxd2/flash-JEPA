@@ -74,7 +74,7 @@ class PredictiveRetina(nn.Module):
         self._init_weights()
         
         # Initialize Optimizer LAST to ensure all parameters are captured
-        self.optimizer = optim.Adam(self.parameters(), lr=0.001)
+        self.optimizer = optim.Adam(self.parameters(), lr=0.0001)
         
         # Apply Orthogonal Initialization
         self._init_weights()

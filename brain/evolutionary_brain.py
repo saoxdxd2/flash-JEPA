@@ -82,10 +82,17 @@ class EvolutionaryBrain:
         
         # Hippocampus (Episodic/Working Memory)
         # Predicts next sensory state (Foveal + Peripheral + Semantic)
+        # Fix: Timescale Separation (Fast Synaptic LR)
         self.hippocampus = TitansMemory(
             input_dim=3 * self.genome.latent_dim,
-            hidden_dim=3 * self.genome.latent_dim
+            hidden_dim=3 * self.genome.latent_dim,
+            learning_rate=0.1 # Fast
         ).to(self.device)
+        
+        # Fix: Timescale Separation (Slow Evolutionary LR for Retina)
+        # We might need to add a set_lr method or handle it in the optimizer
+        # For now, we'll assume the Retina's internal learning (if any) is slow.
+        # PredictiveRetina currently doesn't have a public LR, let's check it.
         
         self.memory = self.replay_buffer 
         

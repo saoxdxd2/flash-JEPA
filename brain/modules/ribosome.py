@@ -12,6 +12,54 @@ class NeuralRibosome(nn.Module):
         super().__init__()
         self.device = device
 
+    def transcribe_differentiable(self, dna_params, shape, base_val, iterations=20) -> torch.Tensor:
+        """
+        Differentiable version of transcribe.
+        Args:
+            dna_params: Flat tensor [num_transforms * 7]
+            shape: (H, W)
+            base_val: float
+        """
+        H, W = shape
+        num_transforms = len(dna_params) // 7
+        
+        # Reshape params: [num_transforms, 7]
+        params = dna_params.view(num_transforms, 7)
+        
+        # Start with a fixed canvas (to ensure gradients only come from params)
+        # Using a fixed seed or zeros/ones
+        canvas = torch.ones(1, 1, H, W, device=self.device) * 0.5
+        
+        # Prepare theta: [num_transforms, 2, 3]
+        # p: [a, b, c, d, e, f, prob]
+        # PyTorch affine_grid: [a, b, e], [c, d, f]
+        theta = torch.stack([
+            torch.stack([params[:, 0], params[:, 1], params[:, 4]], dim=1),
+            torch.stack([params[:, 2], params[:, 3], params[:, 5]], dim=1)
+        ], dim=1)
+        
+        # Probabilities
+        probs = F.softmax(params[:, 6], dim=0) # Use softmax for stable probabilities
+        
+        for _ in range(iterations):
+            new_canvas = torch.zeros_like(canvas)
+            
+            # We can process all transforms in one batch if VRAM allows
+            # [num_transforms, 1, H, W]
+            canvas_batch = canvas.expand(num_transforms, -1, -1, -1)
+            
+            grid = F.affine_grid(theta, canvas_batch.size(), align_corners=False)
+            transformed = F.grid_sample(canvas_batch, grid, align_corners=False)
+            
+            # Weighted Sum: [num_transforms, 1, H, W] * [num_transforms, 1, 1, 1]
+            weighted = transformed * probs.view(-1, 1, 1, 1)
+            new_canvas = torch.sum(weighted, dim=0, keepdim=True)
+            
+            canvas = new_canvas
+            
+        reconstructed = canvas.squeeze() + base_val
+        return reconstructed
+
     def transcribe(self, dna, iterations=20) -> torch.Tensor:
         """
         Reconstructs the weight matrix from Fractal DNA using the Chaos Game or Deterministic Iteration.

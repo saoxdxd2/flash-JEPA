@@ -154,6 +154,7 @@ class NeuralVirtualizationLayer(nn.Module):
         # We use Attention aggregation to handle variable number of NPUs
         self.aggregator_query = nn.Parameter(torch.randn(1, hidden_size))
         self.aggregator_proj = nn.Linear(input_size, hidden_size)
+        self.aggregator_norm = nn.LayerNorm(hidden_size) # Fix: Invariant Aggregation
         
     def forward(self, x, hidden_state=None, memory_state=None):
         start_time = time.time()
@@ -273,6 +274,9 @@ class NeuralVirtualizationLayer(nn.Module):
         
         # [Batch, 1, Active] @ [Batch, Active, Hidden] -> [Batch, 1, Hidden]
         aggregated_output = torch.bmm(agg_attn, proj_out).squeeze(1)
+        
+        # Fix: Invariant Aggregation (V-Sync Jitter)
+        aggregated_output = self.aggregator_norm(aggregated_output)
         
         # --- V-Sync Update ---
         end_time = time.time()
