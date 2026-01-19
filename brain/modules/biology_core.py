@@ -80,9 +80,9 @@ class NeurotransmitterSystem:
             INITIAL_CORTISOL
         ], device=device, dtype=torch.float32)
         
-        # Energy (Scalar)
-        self.energy = INITIAL_ENERGY
-        self.surprise = 0.0 # Track last surprise level
+        # Energy (Tensor)
+        self.energy = torch.tensor(INITIAL_ENERGY, device=device, dtype=torch.float32)
+        self.surprise = torch.tensor(0.0, device=device, dtype=torch.float32) # Track last surprise level
         
         # Pre-fetch Genes / Constants into Tensors for fast computation
         self._init_parameters()
@@ -95,7 +95,7 @@ class NeurotransmitterSystem:
             INITIAL_NOREPINEPHRINE,
             INITIAL_CORTISOL
         ], device=self.device, dtype=torch.float32)
-        self.energy = INITIAL_ENERGY
+        self.energy = torch.tensor(INITIAL_ENERGY, device=self.device, dtype=torch.float32)
         
     def _init_parameters(self):
         """Pre-load genes into tensors to avoid getattr overhead in loop."""
@@ -145,22 +145,22 @@ class NeurotransmitterSystem:
         ], device=self.device)
 
     @property
-    def dopamine(self): return self.state[0].item()
+    def dopamine(self): return self.state[0]
     @dopamine.setter
     def dopamine(self, v): self.state[0] = v
     
     @property
-    def serotonin(self): return self.state[1].item()
+    def serotonin(self): return self.state[1]
     @serotonin.setter
     def serotonin(self, v): self.state[1] = v
     
     @property
-    def norepinephrine(self): return self.state[2].item()
+    def norepinephrine(self): return self.state[2]
     @norepinephrine.setter
     def norepinephrine(self, v): self.state[2] = v
     
     @property
-    def cortisol(self): return self.state[3].item()
+    def cortisol(self): return self.state[3]
     @cortisol.setter
     def cortisol(self, v): self.state[3] = v
 
@@ -168,23 +168,22 @@ class NeurotransmitterSystem:
         """
         Updates chemical levels based on experience (Vectorized).
         """
-        # Ensure inputs are tensors or floats
-        if isinstance(reward_prediction_error, torch.Tensor): reward_prediction_error = reward_prediction_error.item()
+        # Ensure inputs are tensors
+        if not torch.is_tensor(reward_prediction_error):
+            reward_prediction_error = torch.tensor(reward_prediction_error, device=self.device)
         
         # Store surprise for logging
-        if isinstance(surprise, torch.Tensor):
-            self.surprise = surprise.item()
+        if not torch.is_tensor(surprise):
+            self.surprise = torch.tensor(surprise, device=self.device)
         else:
-            self.surprise = float(surprise)
+            self.surprise = surprise
         
         # --- Metabolic Cost ---
         energy_drain = self.metabolic_rate + (effort * self.effort_energy_cost)
-        self.energy = max(0.0, self.energy - energy_drain)
+        self.energy = torch.relu(self.energy - energy_drain)
         
         # Starvation Stress
-        starvation_stress = 0.0
-        if self.energy < self.starvation_threshold:
-            starvation_stress = (self.starvation_threshold - self.energy) / self.starvation_threshold
+        starvation_stress = torch.relu((self.starvation_threshold - self.energy) / self.starvation_threshold)
             
         # Unpack State for readability (views)
         dopamine = self.state[0]
@@ -263,9 +262,9 @@ class NeurotransmitterSystem:
         serotonin_new = torch.where(mask_safety, serotonin_new + delta_recover, serotonin_new)
             
         # --- Metabolic Constraint ---
-        energy_factor = max(MIN_ENERGY_FACTOR, self.energy / MAX_ENERGY)
-        dopamine_new *= energy_factor
-        norepinephrine_new *= energy_factor
+        energy_factor = torch.clamp(self.energy / MAX_ENERGY, min=MIN_ENERGY_FACTOR)
+        dopamine_new = dopamine_new * energy_factor
+        norepinephrine_new = norepinephrine_new * energy_factor
         
         # Update State Tensor
         self.state[0] = dopamine_new
@@ -278,7 +277,7 @@ class NeurotransmitterSystem:
         
     def feed(self, amount):
         """Replenishes energy."""
-        self.energy = min(MAX_ENERGY, self.energy + amount)
+        self.energy = torch.clamp(self.energy + amount, max=MAX_ENERGY)
         
     def get_state_vector(self):
         """Returns the 4-dim chemical state tensor."""

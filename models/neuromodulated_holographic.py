@@ -105,19 +105,39 @@ class HierarchicalBlock(nn.Module):
         return h_new, pred
 
     def resize(self, in_size=None, hidden_size=None):
-        if in_size is not None: self.in_size = in_size
-        if hidden_size is not None: self.hidden_size = hidden_size
+        """Resizes the block while preserving existing weights."""
+        if in_size is None: in_size = self.in_size
+        if hidden_size is None: hidden_size = self.hidden_size
         
-        # Resize VM? 
-        # For now, we just re-init if sizes change drastically, or we could implement smart resizing in VM.
-        # The VM has a resize method for NPUs, but changing hidden_size implies changing register size.
-        # Let's re-init for simplicity in this prototype.
-        self.vm = NeuralVirtualizationLayer(self.in_size, self.hidden_size, max_npus=self.vm.max_npus, memory_size=self.vm.memory_size).to(next(self.parameters()).device)
-        self.P = nn.Linear(self.hidden_size, self.hidden_size).to(next(self.parameters()).device)
+        if in_size == self.in_size and hidden_size == self.hidden_size:
+            return
+            
+        print(f"HierarchicalBlock: Resizing {self.in_size} -> {in_size}, {self.hidden_size} -> {hidden_size}")
         
-        device = self.tau.device
-        if len(self.tau) != self.hidden_size:
-            self.tau = nn.Parameter(torch.rand(self.hidden_size, device=device) * 0.1 + 0.01)
+        # Resize VM (NeuralVirtualizationLayer needs a resize method)
+        if hasattr(self.vm, 'resize'):
+            self.vm.resize(in_size, hidden_size)
+        else:
+            # Fallback: Re-init but this causes amnesia in VM
+            self.vm = NeuralVirtualizationLayer(in_size, hidden_size, max_npus=self.vm.max_npus, memory_size=self.vm.memory_size).to(next(self.parameters()).device)
+            
+        # Resize Predictor (Preserve weights)
+        old_P = self.P
+        self.P = nn.Linear(hidden_size, hidden_size).to(next(self.parameters()).device)
+        with torch.no_grad():
+            min_h = min(self.hidden_size, hidden_size)
+            self.P.weight[:min_h, :min_h] = old_P.weight[:min_h, :min_h]
+            self.P.bias[:min_h] = old_P.bias[:min_h]
+            
+        # Resize Tau
+        old_tau = self.tau
+        self.tau = nn.Parameter(torch.rand(hidden_size, device=old_tau.device) * 0.1 + 0.01)
+        with torch.no_grad():
+            min_h = min(self.hidden_size, hidden_size)
+            self.tau[:min_h] = old_tau[:min_h]
+            
+        self.in_size = in_size
+        self.hidden_size = hidden_size
 
     def detach_state(self):
         """Detach internal states from the computation graph."""
@@ -202,178 +222,6 @@ class NeuromodulatedHolographicBrain(nn.Module):
     #                     mask = (module.indices[1] >= b*64) & (module.indices[1] < (b+1)*64)
     #                     module.values.data[mask] += torch.randn(mask.sum()) * 0.01 * (b / num_blocks)
         
-    def forward(self, input_vector, dt=0.1, reward=0.0, chemicals=None, train_internal_rl=True, memory_input=None):
-        input_vector = input_vector.float()
-        if chemicals is not None: chemicals = chemicals.float()
-        if memory_input is not None: memory_input = memory_input.float()
-        if input_vector.dim() == 1: input_vector = input_vector.unsqueeze(0)
-        batch_size = input_vector.shape[0]
-        
-        if chemicals is not None:
-            if chemicals.dim() == 1:
-                chemicals = chemicals.unsqueeze(0)
-            if chemicals.shape[0] != batch_size:
-                chemicals = chemicals.repeat(batch_size, 1)
-        
-        # Init States
-        if self.h_reflex is None or self.h_reflex.shape[0] != batch_size:
-            self.h_reflex = torch.zeros(batch_size, self.reflex.hidden_size, device=input_vector.device)
-            self.h_concept = torch.zeros(batch_size, self.concept.hidden_size, device=input_vector.device)
-            self.h_strategy = torch.zeros(batch_size, self.strategy.hidden_size, device=input_vector.device)
-            
-        # --- 1. Holographic Encoding ---
-        x = self.input_projection(input_vector).view(batch_size, 1, self.base_res, self.base_res, self.base_res)
-        curr = x
-        for layer in self.encoder_levels:
-            curr = F.relu(layer(curr))
-        encoded_input = curr.flatten(1)
-        
-        # --- 1.5 Thalamic Gating ---
-        if self.thalamus_gate is not None and memory_input is not None:
-            if memory_input.dim() == 1: memory_input = memory_input.unsqueeze(0)
-            encoded_memory = self.memory_projection(memory_input)
-            
-            chem_vec = chemicals if chemicals is not None else torch.tensor([0.5, 0.5, 0.2, 0.0], device=input_vector.device).repeat(batch_size, 1)
-            
-            gate_input = torch.cat([encoded_input, encoded_memory, chem_vec], dim=1)
-            alpha = self.thalamus_gate(gate_input)
-            
-            encoded_input = (alpha * encoded_input) + ((1.0 - alpha) * encoded_memory)
-            if self.training:
-                encoded_input += torch.randn_like(encoded_input) * 0.01
-        
-        # --- 2. Neuromodulated Gating ---
-        if chemicals is None:
-            chemicals = torch.tensor([0.5, 0.5, 0.2, 0.0], device=input_vector.device).repeat(batch_size, 1)
-        
-        meta_input = torch.cat([encoded_input, chemicals], dim=1)
-        gates = torch.sigmoid(self.meta_controller(meta_input))
-        g_reflex, g_concept, g_strategy = torch.chunk(gates, 3, dim=1)
-        
-        # --- 3. Hierarchical Update ---
-        self.h_reflex, p_reflex = self.reflex(encoded_input, self.h_reflex, g_reflex, dt)
-        
-        # Flash Head
-        flash_actions = self.flash_head(self.h_reflex)
-        confidence = torch.sigmoid(self.flash_confidence(self.h_reflex))
-        
-        self.h_concept, p_concept = self.concept(self.h_reflex, self.h_concept, g_concept, dt)
-        self.h_strategy, p_strategy = self.strategy(self.h_concept, self.h_strategy, g_strategy, dt)
-        
-        # Stability: Clip hidden states
-        self.h_reflex = torch.clamp(self.h_reflex, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
-        self.h_concept = torch.clamp(self.h_concept, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
-        self.h_strategy = torch.clamp(self.h_strategy, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
-        
-        # --- 4. Decoding ---
-        full_h = torch.cat([self.h_reflex, self.h_concept, self.h_strategy], dim=1)
-        actions = self.decoder(full_h)
-        value = self.critic(full_h)
-        energy = torch.mean(torch.abs(full_h))
-        
-        flash_data = (flash_actions, confidence, p_reflex, p_concept, p_strategy, self.h_reflex, self.h_concept, self.h_strategy)
-        return actions, value, energy, flash_data
-        
-    def forward_onnx(self, input_vector, chemicals, h_reflex, h_concept, h_strategy, dt=0.1):
-        batch_size = input_vector.shape[0]
-
-        # --- 1. Holographic Encoding ---
-        x = self.input_projection(input_vector).view(batch_size, 1, self.base_res, self.base_res, self.base_res)
-        curr = x
-        for layer in self.encoder_levels:
-            curr = F.relu(layer(curr))
-        encoded_input = curr.flatten(1)
-        
-        # --- 2. Neuromodulated Gating ---
-        if chemicals is None:
-            chemicals = torch.tensor([0.5, 0.5, 0.2, 0.0], device=input_vector.device).repeat(batch_size, 1)
-        
-        meta_input = torch.cat([encoded_input, chemicals], dim=1)
-        gates = torch.sigmoid(self.meta_controller(meta_input))
-        g_reflex, g_concept, g_strategy = torch.chunk(gates, 3, dim=1)
-        
-        # --- 3. Hierarchical Update ---
-        next_h_reflex, p_reflex = self.reflex.forward_onnx(encoded_input, h_reflex, g_reflex, dt)
-        
-        flash_actions = self.flash_head(next_h_reflex)
-        confidence = torch.sigmoid(self.flash_confidence(next_h_reflex))
-        
-        next_h_concept, p_concept = self.concept.forward_onnx(next_h_reflex, h_concept, g_concept, dt)
-        next_h_strategy, p_strategy = self.strategy.forward_onnx(next_h_concept, h_strategy, g_strategy, dt)
-        
-        # --- 4. Decoding ---
-        full_h = torch.cat([next_h_reflex, next_h_concept, next_h_strategy], dim=1)
-        actions = self.decoder(full_h)
-        value = self.critic(full_h)
-        energy = torch.mean(torch.abs(full_h))
-        
-        return actions, value, energy, (flash_actions, confidence, p_reflex, p_concept, p_strategy, next_h_reflex, next_h_concept, next_h_strategy), (next_h_reflex, next_h_concept, next_h_strategy)
-
-    def resize_hidden(self, new_hidden_size):
-        """
-        Dynamically resizes the brain's hidden layers.
-        """
-        print(f"NeuromodulatedHolographicBrain: Resizing hidden_size {self.hidden_size} -> {new_hidden_size}")
-        self.hidden_size = new_hidden_size
-        
-        # Recalculate hierarchical sizes
-        r_size = new_hidden_size // 4
-        s_size = new_hidden_size // 4
-        c_size = new_hidden_size - (r_size + s_size)
-        
-        self.reflex.resize(hidden_size=r_size)
-        self.concept.resize(in_size=r_size, hidden_size=c_size)
-        self.strategy.resize(in_size=c_size, hidden_size=s_size)
-        self.input_projection = nn.Linear(input_size, self.base_res**3 * 4)
-        
-        # --- 1.5 Thalamic Gate ---
-        if self.memory_size is not None and self.memory_size > 0:
-            self.memory_projection = nn.Linear(self.memory_size, self.encoded_size * 4)
-            self.thalamus_gate = nn.Sequential(
-                nn.Linear(self.encoded_size * 4 * 2 + 4, 32),
-                nn.Tanh(),
-                nn.Linear(32, 1),
-                nn.Sigmoid()
-            )
-        else:
-            self.memory_projection = None
-            self.thalamus_gate = None
-        
-        # --- 2. Hierarchical Dimensions ---
-        r_size = hidden_size // 4
-        s_size = hidden_size // 4
-        c_size = hidden_size - (r_size + s_size)
-        
-        # --- 3. Hierarchical Blocks ---
-        self.reflex = HierarchicalBlock(self.encoded_size, r_size, TAU_REFLEX_RANGE)
-        self.concept = HierarchicalBlock(r_size, c_size, TAU_CONCEPT_RANGE)
-        self.strategy = HierarchicalBlock(c_size, s_size, TAU_STRATEGY_RANGE)
-        
-        # --- 4. Neuromodulated Gating ---
-        # Meta controller takes flattened 4D input
-        self.meta_controller = nn.Sequential(
-            nn.Linear(self.encoded_size * 4 + 4, 64),
-            nn.Tanh(),
-            nn.Linear(64, 3) 
-        )
-        
-        # --- 5. Heads ---
-        # Heads take flattened 4D hidden states
-        self.flash_head = nn.Linear(r_size * 4, output_size)
-        self.flash_confidence = nn.Linear(r_size * 4, 1)
-        
-        self.decoder = nn.Linear(hidden_size * 4, output_size)
-        self.intent_gate = nn.Linear(hidden_size * 4, 1)
-        self.critic = nn.Linear(hidden_size * 4, 1)
-        
-        # State
-        self.h_reflex = None
-        self.h_concept = None
-        self.h_strategy = None
-        
-        self._init_routing_specialization()
-        
-    def _init_routing_specialization(self):
         with torch.no_grad():
             for module in [self.reflex.W, self.concept.W, self.strategy.W]:
                 # Handle SparseQuaternionLinear
@@ -526,24 +374,40 @@ class NeuromodulatedHolographicBrain(nn.Module):
         if self.h_strategy is not None: self.h_strategy = self.h_strategy.detach()
 
     def resize_hidden(self, new_hidden_size):
+        """Resizes the brain's hidden layers while preserving weights (Anti-Amnesia)."""
         if new_hidden_size == self.hidden_size: return
         print(f"NeuromodulatedHolographicBrain: Resizing Hidden {self.hidden_size} -> {new_hidden_size}")
-        self.hidden_size = new_hidden_size
+        
+        device = next(self.parameters()).device
+        
+        # Recalculate hierarchical sizes
         r_size = new_hidden_size // 4
         s_size = new_hidden_size // 4
         c_size = new_hidden_size - (r_size + s_size)
         
+        # Resize Blocks
         self.reflex.resize(hidden_size=r_size)
         self.concept.resize(in_size=r_size, hidden_size=c_size)
         self.strategy.resize(in_size=c_size, hidden_size=s_size)
         
-        device = next(self.parameters()).device
-        self.flash_head = nn.Linear(r_size * 4, self.output_size).to(device)
-        self.flash_confidence = nn.Linear(r_size * 4, 1).to(device)
-        self.decoder = nn.Linear(new_hidden_size * 4, self.output_size).to(device)
-        self.intent_gate = nn.Linear(new_hidden_size * 4, 1).to(device)
-        self.critic = nn.Linear(new_hidden_size * 4, 1).to(device)
+        # Resize Heads (Preserve weights)
+        def resize_linear(layer, in_dim, out_dim):
+            old_layer = layer
+            new_layer = nn.Linear(in_dim, out_dim).to(device)
+            with torch.no_grad():
+                m_in = min(old_layer.in_features, in_dim)
+                m_out = min(old_layer.out_features, out_dim)
+                new_layer.weight[:m_out, :m_in] = old_layer.weight[:m_out, :m_in]
+                new_layer.bias[:m_out] = old_layer.bias[:m_out]
+            return new_layer
+
+        self.flash_head = resize_linear(self.flash_head, r_size, self.output_size)
+        self.flash_confidence = resize_linear(self.flash_confidence, r_size, 1)
+        self.decoder = resize_linear(self.decoder, new_hidden_size, self.output_size)
+        self.intent_gate = resize_linear(self.intent_gate, new_hidden_size, 1)
+        self.critic = resize_linear(self.critic, new_hidden_size, 1)
         
+        self.hidden_size = new_hidden_size
         self.reset_state()
 
     def resize_input(self, new_input_size):

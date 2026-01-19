@@ -110,7 +110,7 @@ class EvolutionaryBrain:
         self.cortex = FractalBrain(dna_path="models/fractal_brain.pt", device=self.device)
         
         # --- 10. Optimizers ---
-        self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate * 2.0)
+        self._init_optimizer()
         
         # --- Interface (Cradle) ---
         self.cradle = Cradle()
@@ -215,10 +215,7 @@ class EvolutionaryBrain:
         self.genome.hidden_size = new_hidden_size # Persist change
         
         # 2. Re-initialize Optimizer (Parameters changed)
-        self.trm_optimizer = torch.optim.Adam(
-            self.trm.parameters(), 
-            lr=self.genome.learning_rate
-        )
+        self._init_optimizer()
         print(f"Brain Resized Successfully. New Hidden Size: {self.hidden_size}")
 
     def decide(self, full_input_tensor, train_internal_rl=True, greedy=False, disable_reflex=False):
@@ -380,9 +377,15 @@ class EvolutionaryBrain:
         
         try:
             # JEPA Loss: Predict the NEXT hidden state
-            jepa_loss = F.mse_loss(p_reflex, t_reflex) + \
-                        F.mse_loss(p_concept, t_concept) + \
-                        F.mse_loss(p_strategy, t_strategy)
+            # FIX: Flatten targets to match 2D predictors [Batch, Hidden]
+            # p_reflex is [Batch, r_size], t_reflex is [Batch, max_npus, reg_size]
+            t_reflex_flat = t_reflex.view(t_reflex.size(0), -1)
+            t_concept_flat = t_concept.view(t_concept.size(0), -1)
+            t_strategy_flat = t_strategy.view(t_strategy.size(0), -1)
+            
+            jepa_loss = F.mse_loss(p_reflex, t_reflex_flat) + \
+                        F.mse_loss(p_concept, t_concept_flat) + \
+                        F.mse_loss(p_strategy, t_strategy_flat)
         except RuntimeError as e:
             print(f"DEBUG: Shape Mismatch in JEPA Loss!")
             print(f"DEBUG: p_reflex: {p_reflex.shape}, t_reflex: {t_reflex.shape}")
@@ -450,6 +453,11 @@ class EvolutionaryBrain:
             # Default to zeros if not provided (e.g. first step)
             memory_latent = torch.zeros(3 * self.latent_dim, device=foveal_latent.device)
         
+        # --- Latent Adapter Integration ---
+        # If semantic_latent is from a high-dim teacher (e.g. 4096), project it
+        if semantic_latent.shape[-1] == self.genome.latent_adapter_dim:
+            semantic_latent = self.latent_adapter(semantic_latent.unsqueeze(0)).squeeze(0)
+        
         full_input = torch.cat([
             foveal_latent.flatten(),
             peripheral_latent.flatten(),
@@ -459,6 +467,22 @@ class EvolutionaryBrain:
             last_action_vec,
             torch.zeros(max(0, padding_size), device=foveal_latent.device)
         ]).unsqueeze(0)
+        
+        # --- Fractal Cortex Integration (Deep Reasoning) ---
+        # Use the cortex to process the semantic stream in parallel
+        if hasattr(self, 'cortex') and self.cortex is not None:
+            # FractalBrain expects [Batch, Seq, Hidden]
+            # We treat the current semantic state as a single-token sequence
+            cortex_input = semantic_latent.view(1, 1, -1)
+            # Ensure dimension matches cortex config (4096)
+            if cortex_input.shape[-1] != self.cortex.config['hidden_size']:
+                # Temporary projection if needed, or just skip if mismatch
+                pass
+            else:
+                cortex_output = self.cortex(cortex_input)
+                # Mix cortex output back into full_input or use it to bias logits
+                # For now, we just ensure it's in the graph
+                self.last_cortex_output = cortex_output
         
         return full_input
 
@@ -774,7 +798,7 @@ class EvolutionaryBrain:
             
         # Re-init optimizer after loading to ensure it tracks the current parameters
         # and starts with fresh momentum/state for the new model
-        self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate)
+        self._init_optimizer()
         
         print(f"Brain: Successfully loaded v{version} checkpoint.")
 
@@ -789,7 +813,7 @@ class EvolutionaryBrain:
         if hasattr(self.trm, 'resize_input'):
             self.trm.resize_input(self.input_size)
         # Re-init optimizer for new parameters
-        self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate)
+        self._init_optimizer()
 
     def resize_hidden(self, new_hidden_size):
         if new_hidden_size == self.hidden_size: return
@@ -798,8 +822,19 @@ class EvolutionaryBrain:
         self.genome.hidden_size = new_hidden_size
         if hasattr(self.trm, 'resize_hidden'):
             self.trm.resize_hidden(new_hidden_size)
-        # Re-init optimizer for new parameters
-        self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate)
+
+    def _init_optimizer(self):
+        """Unifies all learnable modules into a single optimizer."""
+        self.trm_optimizer = torch.optim.Adam([
+            {'params': self.trm.parameters(), 'lr': self.genome.learning_rate * 2.0},
+            {'params': self.amygdala.parameters(), 'lr': self.genome.learning_rate},
+            {'params': self.basal_ganglia.parameters(), 'lr': self.genome.learning_rate},
+            {'params': self.latent_adapter.parameters(), 'lr': self.genome.learning_rate},
+            {'params': self.cortex.parameters(), 'lr': self.genome.learning_rate * 0.5},
+            {'params': self.broca.parameters(), 'lr': self.genome.learning_rate},
+            {'params': self.retina.parameters(), 'lr': self.genome.learning_rate * 0.1}
+        ])
+        print("EvolutionaryBrain: Unified Optimizer Initialized.")
 
     def train_cognitive_task(self, inputs, targets):
         """
@@ -822,7 +857,7 @@ class EvolutionaryBrain:
         
         # Use existing optimizer
         if not hasattr(self, 'trm_optimizer'):
-             self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate)
+             self._init_optimizer()
              
         self.trm_optimizer.zero_grad()
         
@@ -856,3 +891,12 @@ class EvolutionaryBrain:
         avg_loss = total_loss.item() / seq_len
         self.last_surprise = avg_loss # Update surprise for neuroplasticity
         return avg_loss
+
+if __name__ == "__main__":
+    print("Testing EvolutionaryBrain Initialization...")
+    brain = EvolutionaryBrain(device='cpu')
+    print("Brain Initialized Successfully.")
+    print(f"Optimizer: {brain.trm_optimizer}")
+    print(f"Number of parameter groups: {len(brain.trm_optimizer.param_groups)}")
+    for i, group in enumerate(brain.trm_optimizer.param_groups):
+        print(f"Group {i}: LR={group['lr']}, Params={len(group['params'])}")

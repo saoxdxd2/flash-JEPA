@@ -147,7 +147,7 @@ class SparseLinear(nn.Module):
                 self.col_indices = None
 
     def resize(self, in_features=None, out_features=None):
-        """Resizes the layer while attempting to preserve existing weights."""
+        """Resizes the layer while preserving existing weights (Anti-Amnesia)."""
         if in_features is None: in_features = self.in_features
         if out_features is None: out_features = self.out_features
         
@@ -156,25 +156,43 @@ class SparseLinear(nn.Module):
             
         print(f"SparseLinear: Resizing ({self.in_features}, {self.out_features}) -> ({in_features}, {out_features})")
         
-        # Create new indices and values
-        num_non_zero = int(in_features * out_features * (1 - self.sparsity))
-        num_non_zero = max(num_non_zero, MIN_NON_ZERO_CONNECTIONS)
-        
-        new_indices = torch.randint(0, in_features, (2, num_non_zero))
-        new_indices[1] = torch.randint(0, out_features, (num_non_zero,))
-        new_values = torch.randn(num_non_zero) * (1.0 / np.sqrt(in_features))
-        new_bias = torch.zeros(out_features)
-        
-        self.in_features = in_features
-        self.out_features = out_features
-        self.indices = new_indices.to(self.indices.device)
-        self.values = nn.Parameter(new_values.to(self.values.device))
-        self.bias = nn.Parameter(new_bias.to(self.bias.device))
-        
-        # Reset CSR cache
-        self.crow_indices = None
-        self.col_indices = None
-        
-        # Resize activity buffers
-        self.register_buffer('activity_in', torch.zeros(in_features, device=self.indices.device), persistent=False)
-        self.register_buffer('activity_out', torch.zeros(out_features, device=self.indices.device), persistent=False)
+        with torch.no_grad():
+            # 1. Filter existing indices that fit in the new dimensions
+            mask = (self.indices[0] < in_features) & (self.indices[1] < out_features)
+            preserved_indices = self.indices[:, mask]
+            preserved_values = self.values[mask]
+            
+            # 2. Calculate how many new connections we need to maintain sparsity
+            target_non_zero = int(in_features * out_features * (1 - self.sparsity))
+            target_non_zero = max(target_non_zero, MIN_NON_ZERO_CONNECTIONS)
+            
+            num_to_add = target_non_zero - preserved_indices.shape[1]
+            
+            if num_to_add > 0:
+                # Add new random connections
+                new_idx = torch.randint(0, in_features, (2, num_to_add), device=self.indices.device)
+                new_idx[1] = torch.randint(0, out_features, (num_to_add,), device=self.indices.device)
+                new_vals = torch.randn(num_to_add, device=self.values.device) * (1.0 / np.sqrt(in_features))
+                
+                self.indices = torch.cat([preserved_indices, new_idx], dim=1)
+                self.values = nn.Parameter(torch.cat([preserved_values, new_vals]))
+            else:
+                self.indices = preserved_indices
+                self.values = nn.Parameter(preserved_values)
+                
+            # 3. Resize Bias
+            new_bias = torch.zeros(out_features, device=self.bias.device)
+            min_out = min(self.out_features, out_features)
+            new_bias[:min_out] = self.bias[:min_out]
+            self.bias = nn.Parameter(new_bias)
+            
+            self.in_features = in_features
+            self.out_features = out_features
+            
+            # Reset CSR cache
+            self.crow_indices = None
+            self.col_indices = None
+            
+            # Resize activity buffers
+            self.register_buffer('activity_in', torch.zeros(in_features, device=self.indices.device), persistent=False)
+            self.register_buffer('activity_out', torch.zeros(out_features, device=self.indices.device), persistent=False)

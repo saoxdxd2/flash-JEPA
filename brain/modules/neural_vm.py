@@ -115,10 +115,56 @@ class VectorizedNPU(nn.Module):
             'gate': ssd_gate
         }
         
-        # 5. Output
-        output_active = self.output_interface(new_regs_active)
-        
         return output_active, new_regs_active, write_intent, ssd_intent
+
+    def resize(self, new_input_size=None, new_register_size=None, new_memory_dim=None):
+        """Resizes the NPU while preserving weights."""
+        if new_input_size is None: new_input_size = self.input_size
+        if new_register_size is None: new_register_size = self.register_size
+        if new_memory_dim is None: new_memory_dim = self.memory_dim
+        
+        if new_input_size == self.input_size and new_register_size == self.register_size and new_memory_dim == self.memory_dim:
+            return
+            
+        print(f"VectorizedNPU: Resizing Input {self.input_size}->{new_input_size}, Reg {self.register_size}->{new_register_size}, Mem {self.memory_dim}->{new_memory_dim}")
+        
+        device = next(self.parameters()).device
+        
+        # 1. Resize GRU Cell
+        old_gru = self.gru_cell
+        new_input_dim = new_input_size + new_memory_dim
+        self.gru_cell = nn.GRUCell(new_input_dim, new_register_size).to(device)
+        with torch.no_grad():
+            m_in = min(old_gru.input_size, new_input_dim)
+            m_reg = min(old_gru.hidden_size, new_register_size)
+            # GRU weights are complex, but we can copy the blocks
+            self.gru_cell.weight_ih[:m_reg*3, :m_in] = old_gru.weight_ih[:m_reg*3, :m_in]
+            self.gru_cell.weight_hh[:m_reg*3, :m_reg] = old_gru.weight_hh[:m_reg*3, :m_reg]
+            self.gru_cell.bias_ih[:m_reg*3] = old_gru.bias_ih[:m_reg*3]
+            self.gru_cell.bias_hh[:m_reg*3] = old_gru.bias_hh[:m_reg*3]
+            
+        # 2. Resize MMU
+        old_mmu = self.mmu
+        new_mmu_out = new_memory_dim * 5 + 4
+        self.mmu = nn.Linear(new_register_size, new_mmu_out).to(device)
+        with torch.no_grad():
+            m_reg = min(self.register_size, new_register_size)
+            m_out = min(old_mmu.out_features, new_mmu_out)
+            self.mmu.weight[:m_out, :m_reg] = old_mmu.weight[:m_out, :m_reg]
+            self.mmu.bias[:m_out] = old_mmu.bias[:m_out]
+            
+        # 3. Resize Output Interface
+        old_out = self.output_interface
+        self.output_interface = nn.Linear(new_register_size, new_input_size).to(device)
+        with torch.no_grad():
+            m_reg = min(self.register_size, new_register_size)
+            m_in = min(self.input_size, new_input_size)
+            self.output_interface.weight[:m_in, :m_reg] = old_out.weight[:m_in, :m_reg]
+            self.output_interface.bias[:m_in] = old_out.bias[:m_in]
+            
+        self.input_size = new_input_size
+        self.register_size = new_register_size
+        self.memory_dim = new_memory_dim
 
 from brain.modules.neural_ssd import NeuralSSD
 
@@ -157,7 +203,6 @@ class NeuralVirtualizationLayer(nn.Module):
         self.aggregator_norm = nn.LayerNorm(hidden_size) # Fix: Invariant Aggregation
         
     def forward(self, x, hidden_state=None, memory_state=None):
-        start_time = time.time()
         batch_size = x.shape[0]
         device = x.device
         
@@ -203,38 +248,37 @@ class NeuralVirtualizationLayer(nn.Module):
         read_gate = ssd_gates[:, :, 0]
         write_gate = ssd_gates[:, :, 1]
         
-        # Write to SSD
-        # If mean write gate > 0.5, we write.
+        # Write to SSD (Soft Gating)
         avg_write_gate = write_gate.mean(dim=1) # [Batch]
-        if avg_write_gate.mean() > 0.5:
-            # Aggregate Key/Value
-            # Weighted average by write_gate
-            # [Batch, Active, 1] * [Batch, Active, Dim] -> Sum -> [Batch, Dim]
-            w_sum = write_gate.sum(dim=1, keepdim=True) + 1e-6
-            agg_key = (ssd_keys * write_gate.unsqueeze(2)).sum(dim=1) / w_sum
-            agg_val = (ssd_vals * write_gate.unsqueeze(2)).sum(dim=1) / w_sum
-            
+        # Soft threshold: sigmoid((avg - 0.5) * scale)
+        write_mask = torch.sigmoid((avg_write_gate - 0.5) * 10.0)
+        
+        # Aggregate Key/Value
+        w_sum = write_gate.sum(dim=1, keepdim=True) + 1e-6
+        agg_key = (ssd_keys * write_gate.unsqueeze(2)).sum(dim=1) / w_sum
+        agg_val = (ssd_vals * write_gate.unsqueeze(2)).sum(dim=1) / w_sum
+        
+        # SSD write is usually non-differentiable (database), 
+        # but we can at least make the decision soft.
+        # For now, we only write if the soft mask is high enough
+        if write_mask.mean() > 0.5:
             self.ssd.write(agg_key, agg_val)
             
-        # Read from SSD
-        # If mean read gate > 0.5, we read.
+        # Read from SSD (Soft Gating)
         avg_read_gate = read_gate.mean(dim=1)
-        if avg_read_gate.mean() > 0.5:
-             w_sum = read_gate.sum(dim=1, keepdim=True) + 1e-6
-             # ssd_keys: [Batch, Active, Dim]
-             # read_gate: [Batch, Active] -> [Batch, Active, 1]
-             # sum(dim=1) -> [Batch, Dim]
-             # w_sum: [Batch, 1]
-             agg_key = (ssd_keys * read_gate.unsqueeze(2)).sum(dim=1) / w_sum
-             
-             read_vals, _ = self.ssd.read(agg_key)
-             # read_vals: [Batch, 1, Dim] -> [Batch, Dim]
-             read_val = read_vals.squeeze(1)
-             
-             # DMA Write to Memory Slot 0
-             # We modify new_memory_state in place (clone first)
-             new_memory_state = new_memory_state.clone()
-             new_memory_state[:, 0, :] = read_val
+        read_mask = torch.sigmoid((avg_read_gate - 0.5) * 10.0)
+        
+        w_sum = read_gate.sum(dim=1, keepdim=True) + 1e-6
+        agg_key = (ssd_keys * read_gate.unsqueeze(2)).sum(dim=1) / w_sum
+        
+        read_vals, _ = self.ssd.read(agg_key)
+        read_val = read_vals.squeeze(1)
+        
+        # DMA Write to Memory Slot 0 (Soft)
+        # We blend the read value based on the read_mask
+        new_memory_state = new_memory_state.clone()
+        new_memory_state[:, 0, :] = (1.0 - read_mask.unsqueeze(1)) * new_memory_state[:, 0, :] + \
+                                     read_mask.unsqueeze(1) * read_val
         
         # --- Memory Update (Write Back) ---
         # Aggregate writes from active NPUs
@@ -278,10 +322,8 @@ class NeuralVirtualizationLayer(nn.Module):
         # Fix: Invariant Aggregation (V-Sync Jitter)
         aggregated_output = self.aggregator_norm(aggregated_output)
         
-        # --- V-Sync Update ---
-        end_time = time.time()
-        duration = end_time - start_time
-        self.update_vsync(duration)
+        # --- V-Sync Update (Disabled in forward for differentiability) ---
+        # self.update_vsync(duration)
         
         return aggregated_output, new_hidden_state, new_memory_state
 
@@ -308,7 +350,52 @@ class NeuralVirtualizationLayer(nn.Module):
             if self.active_npus > 1:
                 self.active_npus -= 1
                 
-    def resize(self, new_num_npus=None):
-        # Manual resize override
+    def resize(self, new_input_size=None, new_hidden_size=None):
+        """Resizes the virtualization layer while preserving weights."""
+        if new_input_size is None: new_input_size = self.input_size
+        if new_hidden_size is None: new_hidden_size = self.hidden_size
+        
+        if new_input_size == self.input_size and new_hidden_size == self.hidden_size:
+            return
+            
+        print(f"NeuralVirtualizationLayer: Resizing Input {self.input_size}->{new_input_size}, Hidden {self.hidden_size}->{new_hidden_size}")
+        
+        device = next(self.parameters()).device
+        
+        # Recalculate NPU sizes
+        new_reg_size = new_hidden_size // 4
+        new_mem_dim = new_reg_size
+        
+        # 1. Resize NPU
+        self.vectorized_npu.resize(new_input_size, new_reg_size, new_mem_dim)
+        
+        # 2. Resize SSD
+        if hasattr(self.ssd, 'resize'):
+            self.ssd.resize(new_mem_dim)
+            
+        # 3. Resize Aggregator
+        old_proj = self.aggregator_proj
+        self.aggregator_proj = nn.Linear(new_input_size, new_hidden_size).to(device)
+        with torch.no_grad():
+            m_in = min(self.input_size, new_input_size)
+            m_h = min(self.hidden_size, new_hidden_size)
+            self.aggregator_proj.weight[:m_h, :m_in] = old_proj.weight[:m_h, :m_in]
+            self.aggregator_proj.bias[:m_h] = old_proj.bias[:m_h]
+            
+        old_query = self.aggregator_query
+        self.aggregator_query = nn.Parameter(torch.randn(1, new_hidden_size, device=device))
+        with torch.no_grad():
+            m_h = min(self.hidden_size, new_hidden_size)
+            self.aggregator_query.data[:, :m_h] = old_query.data[:, :m_h]
+            
+        self.aggregator_norm = nn.LayerNorm(new_hidden_size).to(device)
+        
+        self.input_size = new_input_size
+        self.hidden_size = new_hidden_size
+        self.npu_register_size = new_reg_size
+        self.memory_dim = new_mem_dim
+        
+    def resize_npus(self, new_num_npus=None):
+        # Manual resize override for active NPUs
         if new_num_npus:
             self.active_npus = min(new_num_npus, self.max_npus)

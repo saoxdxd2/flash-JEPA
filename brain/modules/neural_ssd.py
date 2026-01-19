@@ -22,30 +22,6 @@ class NeuralSSD(nn.Module):
         
         # Memory Buffers (Persistent)
         # We use buffers so they are part of the state_dict but not trained by SGD directly (usually).
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import os
-
-class NeuralSSD(nn.Module):
-    """
-    Neural Solid State Drive (N-SSD).
-    A persistent, content-addressable memory store.
-    
-    Features:
-    - Vector Storage: Stores (Key, Value) pairs.
-    - Content Addressing: Retrieval via Cosine Similarity.
-    - Persistence: Saves/Loads from disk.
-    """
-    def __init__(self, key_dim, value_dim, capacity=10000, storage_path="neural_ssd.pt"):
-        super().__init__()
-        self.key_dim = key_dim
-        self.value_dim = value_dim
-        self.capacity = capacity
-        self.storage_path = storage_path
-        
-        # Memory Buffers (Persistent)
-        # We use buffers so they are part of the state_dict but not trained by SGD directly (usually).
         # Actually, we want them to be updated explicitly, not by optimizer.
         self.register_buffer("keys", torch.zeros(capacity, key_dim))
         self.register_buffer("values", torch.zeros(capacity, value_dim))
@@ -157,3 +133,25 @@ class NeuralSSD(nn.Module):
                 print(f"NeuralSSD Objects loaded.")
             except Exception as e:
                 print(f"Failed to load NeuralSSD Objects: {e}")
+
+    def resize(self, new_dim):
+        """Resizes the key and value dimensions while preserving data."""
+        if new_dim == self.key_dim and new_dim == self.value_dim:
+            return
+            
+        print(f"NeuralSSD: Resizing {self.key_dim} -> {new_dim}")
+        
+        with torch.no_grad():
+            # Resize Keys
+            old_keys = self.keys
+            self.register_buffer("keys", torch.zeros(self.capacity, new_dim, device=old_keys.device))
+            min_dim = min(self.key_dim, new_dim)
+            self.keys[:, :min_dim] = old_keys[:, :min_dim]
+            
+            # Resize Values
+            old_values = self.values
+            self.register_buffer("values", torch.zeros(self.capacity, new_dim, device=old_values.device))
+            self.values[:, :min_dim] = old_values[:, :min_dim]
+            
+            self.key_dim = new_dim
+            self.value_dim = new_dim

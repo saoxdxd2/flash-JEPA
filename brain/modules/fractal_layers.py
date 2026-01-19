@@ -71,19 +71,48 @@ class FractalLinear(nn.Module):
         num_points = 1000 
         points = torch.rand(num_points, 2, device=self.device) * 2 - 1
         
+        # Gumbel-Softmax for differentiable transform selection
+        # We use a straight-through estimator or just soft selection
+        logits = params[:, 6].unsqueeze(0).expand(num_points, -1)
+        
         for _ in range(10): # Warmup
-            t_idx = torch.multinomial(probs, num_points, replacement=True)
-            t_theta = theta[t_idx]
+            # [num_points, num_transforms]
+            gumbel_weights = F.gumbel_softmax(logits, tau=1.0, hard=True)
+            
+            # [num_points, 2, 3]
+            t_theta = torch.sum(gumbel_weights.view(num_points, num_transforms, 1, 1) * theta.unsqueeze(0), dim=1)
+            
             points_homo = torch.cat([points, torch.ones(num_points, 1, device=self.device)], dim=1).unsqueeze(2)
             points = torch.bmm(t_theta, points_homo).squeeze(2)
             
-        y_idx = ((points[:, 1] + 1) / 2 * (H - 1)).long().clamp(0, H - 1)
-        x_idx = ((points[:, 0] + 1) / 2 * (W - 1)).long().clamp(0, W - 1)
+        # Differentiable Indexing (Soft Assignment)
+        # Instead of .long(), we use a soft-binning or grid_sample logic
+        # For a dot product Y = X @ W, where W is a set of points (y_i, x_i)
+        # Y[y_i] = sum(X[x_i])
         
+        # Normalize points to [0, 1]
+        y_coords = (points[:, 1] + 1) / 2 * (H - 1)
+        x_coords = (points[:, 0] + 1) / 2 * (W - 1)
+        
+        # Soft-scatter (Simplified: using linear interpolation weights)
+        # This is a bit complex to do perfectly in 1D, but we can use a kernel
         y = torch.zeros(B, H, device=self.device)
-        x_vals = x[:, x_idx]
-        y_idx_expanded = y_idx.unsqueeze(0).expand(B, -1)
-        y.scatter_add_(1, y_idx_expanded, x_vals)
+        
+        # For each point, we contribute to the two nearest integer indices
+        y_low = torch.floor(y_coords).long().clamp(0, H - 2)
+        y_high = y_low + 1
+        y_weight = y_coords - y_low.float()
+        
+        x_low = torch.floor(x_coords).long().clamp(0, W - 2)
+        x_high = x_low + 1
+        x_weight = x_coords - x_low.float()
+        
+        # Gather X values (Soft)
+        x_vals = x[:, x_low] * (1 - x_weight) + x[:, x_high] * x_weight
+        
+        # Scatter to Y (Soft)
+        y.scatter_add_(1, y_low.unsqueeze(0).expand(B, -1), x_vals * (1 - y_weight))
+        y.scatter_add_(1, y_high.unsqueeze(0).expand(B, -1), x_vals * y_weight)
         
         return y / num_points
 

@@ -156,7 +156,7 @@ class BasalGanglia(nn.Module):
         # Blend basal ganglia output with cortical proposals
         # High dopamine → trust BG, Low dopamine → trust cortex
         bg_weight = torch.clamp(
-            torch.tensor(dopamine * BG_WEIGHT_DOPAMINE_SCALE + BG_WEIGHT_BASELINE), 
+            dopamine * BG_WEIGHT_DOPAMINE_SCALE + BG_WEIGHT_BASELINE, 
             BG_WEIGHT_MIN, 
             BG_WEIGHT_MAX
         )
@@ -186,23 +186,28 @@ class BasalGanglia(nn.Module):
         flash_actions, flash_confidence = None, 0.0
         if flash_info is not None:
             flash_actions, flash_confidence = flash_info
-            if hasattr(flash_confidence, 'item'):
-                flash_confidence = flash_confidence.mean().item()
+            if torch.is_tensor(flash_confidence):
+                flash_confidence = flash_confidence.mean()
                 
         # System 1 threshold based on internal confidence
         system_1_threshold = (
             SYSTEM_1_BASE_THRESHOLD - 
             (dopamine * SYSTEM_1_DOPAMINE_REDUCTION) - 
-            (confidence.item() * SYSTEM_1_CONFIDENCE_REDUCTION)
+            (confidence * SYSTEM_1_CONFIDENCE_REDUCTION)
         )
         
-        # Ensure surprise is a scalar or tensor
-        if torch.is_tensor(surprise):
-            surprise_val = surprise.mean().item()
+        # Ensure surprise is a tensor
+        if not torch.is_tensor(surprise):
+            surprise_val = torch.tensor(surprise, device=state.device)
         else:
-            surprise_val = surprise
+            surprise_val = surprise.mean()
             
-        if flash_actions is not None and flash_confidence > system_1_threshold and surprise_val < SURPRISE_THRESHOLD_FOR_SYSTEM1:
+        # Gating Logic (Differentiable-ish)
+        # We use a soft mask to allow gradients to flow to both paths if needed
+        # But for hard selection, we'll keep the used_system flag
+        is_system_1 = (flash_confidence > system_1_threshold) & (surprise_val < SURPRISE_THRESHOLD_FOR_SYSTEM1)
+        
+        if flash_actions is not None and is_system_1.any():
             used_system = 1
             output_logits = flash_actions if flash_actions.dim() > 1 else flash_actions.unsqueeze(0)
         else:
@@ -215,17 +220,14 @@ class BasalGanglia(nn.Module):
             logits_np = logits_np.flatten()
             
         if greedy:
-            action = int(np.argmax(logits_np))
+            action = torch.argmax(output_logits, dim=-1).item()
         else:
             # Temperature based on dopamine (high DA → more exploitation)
-            temperature = max(TEMPERATURE_MIN, 1.0 - dopamine * TEMPERATURE_DOPAMINE_SCALE)
-            exp_logits = np.exp((logits_np - np.max(logits_np)) / temperature)
-            probs = exp_logits / (np.sum(exp_logits) + 1e-8)
+            temperature = torch.clamp(1.0 - dopamine * TEMPERATURE_DOPAMINE_SCALE, min=TEMPERATURE_MIN)
+            probs = F.softmax(output_logits / temperature, dim=-1)
             
-            if np.isnan(probs).any():
-                probs = np.ones(self.action_size) / self.action_size
-                
-            action = int(np.random.choice(self.action_size, p=probs))
+            # Sample action
+            action = torch.multinomial(probs, 1).item()
             
         # Store eligibility traces for learning
         self.go_trace = go_signal.detach()
@@ -233,11 +235,11 @@ class BasalGanglia(nn.Module):
         
         meta = {
             'used_system': used_system,
-            'go_signal': go_signal.mean().item(),
-            'nogo_signal': nogo_signal.mean().item(),
-            'stn_inhibition': stn_inhibition.mean().item(),
-            'confidence': confidence.item(),
-            'predicted_value': predicted_value.mean().item()
+            'go_signal': go_signal.mean(),
+            'nogo_signal': nogo_signal.mean(),
+            'stn_inhibition': stn_inhibition.mean(),
+            'confidence': confidence.mean(),
+            'predicted_value': predicted_value.mean()
         }
         
         return action, meta
