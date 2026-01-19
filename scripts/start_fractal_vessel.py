@@ -124,8 +124,8 @@ def compress_qwen_to_fractal_dna():
         
         for shape, items in grouped_layers.items():
             # items is list of (key, tensor)
-            # Process in sub-batches if too large (e.g. > 32)
-            SUB_BATCH_SIZE = 32
+            # Process in sub-batches if too large
+            SUB_BATCH_SIZE = 8 # Reduced from 32 to prevent OOM
             
             for i in range(0, len(items), SUB_BATCH_SIZE):
                 sub_items = items[i : i + SUB_BATCH_SIZE]

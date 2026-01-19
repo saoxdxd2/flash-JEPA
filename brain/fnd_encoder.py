@@ -85,57 +85,45 @@ class FractalEncoder:
             # sample_coords expanded: [B, num_samples, 1, 2]
             sample_coords_expanded = sample_coords.expand(B, -1, -1, -1)
             
-            target_samples = torch.nn.functional.grid_sample(target_input, sample_coords_expanded, align_corners=False)
+            # We need target_samples at the *original* coordinates for loss calculation
             # target_samples: [B, 1, N, 1]
+            target_samples = torch.nn.functional.grid_sample(target_input, sample_coords_expanded, align_corners=False)
             
             # Accumulate weighted sum
-            # reconstructed_samples = torch.zeros_like(target_samples)
+            # We iterate over transforms to avoid replicating target_input T times (which caused OOM)
+            weighted_sum = torch.zeros_like(target_samples)
             probs = torch.softmax(probs_logits, dim=1) # [B, T]
             
             theta_all = params.view(B, num_transforms, 2, 3)
-            
-            # Process transforms
-            # We can process all transforms in parallel if memory allows.
-            # B*T*N*2 floats. 
             
             # coords_homo: [1, N, 3]
             coords_flat = sample_coords.view(1, num_samples, 2)
             ones = torch.ones(1, num_samples, 1, device=self.device)
             coords_homo = torch.cat([coords_flat, ones], dim=2) # [1, N, 3]
             
-            # Expand coords for Batch and Transforms
-            # We want [B, T, N, 3]
-            coords_expanded = coords_homo.unsqueeze(1).expand(B, num_transforms, -1, -1) # [B, T, N, 3]
+            # Expand coords for Batch: [B, N, 3]
+            coords_expanded = coords_homo.expand(B, -1, -1)
             
-            # Theta: [B, T, 2, 3] -> Transpose to [B, T, 3, 2]
-            theta_T = theta_all.transpose(2, 3)
-            
-            # Matmul: [B, T, N, 3] @ [B, T, 3, 2] -> [B, T, N, 2]
-            transformed_coords = torch.matmul(coords_expanded, theta_T)
-            
-            # Reshape for grid_sample
-            # We need to sample from target_input [B, 1, H, W]
-            # But we have T grids per batch item.
-            # We can fold B*T into batch dim?
-            # target_input expanded: [B*T, 1, H, W]
-            target_folded = target_input.repeat_interleave(num_transforms, dim=0)
-            
-            # grid folded: [B*T, N, 1, 2]
-            grid_folded = transformed_coords.view(B * num_transforms, num_samples, 1, 2)
-            
-            # Sample
-            samples_folded = torch.nn.functional.grid_sample(target_folded, grid_folded, align_corners=False)
-            # samples_folded: [B*T, 1, N, 1]
-            
-            # Unfold
-            samples = samples_folded.view(B, num_transforms, 1, num_samples, 1)
-            
-            # Weighting
-            # probs: [B, T] -> [B, T, 1, 1, 1]
-            probs_expanded = probs.view(B, num_transforms, 1, 1, 1)
-            
-            # Sum over T
-            weighted_sum = torch.sum(samples * probs_expanded, dim=1) # [B, 1, N, 1]
+            for t in range(num_transforms):
+                # Theta for this transform: [B, 2, 3]
+                theta_t = theta_all[:, t, :, :]
+                
+                # Transpose: [B, 3, 2]
+                theta_t_T = theta_t.transpose(1, 2)
+                
+                # Transform coords: [B, N, 3] @ [B, 3, 2] -> [B, N, 2]
+                grid_t = torch.bmm(coords_expanded, theta_t_T)
+                
+                # Reshape for grid_sample: [B, N, 1, 2]
+                grid_t = grid_t.view(B, num_samples, 1, 2)
+                
+                # Sample: [B, 1, N, 1]
+                sample_t = torch.nn.functional.grid_sample(target_input, grid_t, align_corners=False)
+                
+                # Weight: [B, 1, 1, 1]
+                prob_t = probs[:, t].view(B, 1, 1, 1)
+                
+                weighted_sum = weighted_sum + sample_t * prob_t
             
             loss = torch.nn.functional.mse_loss(weighted_sum, target_samples)
             
