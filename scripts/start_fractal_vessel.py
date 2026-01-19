@@ -58,7 +58,7 @@ def compress_qwen_to_fractal_dna():
     weight_map = index_data["weight_map"]
     
     # 3. Compression Loop
-    # We process shard by shard to avoid OOM
+    # We process shards in batches to optimize download/compute overlap and disk usage
     unique_shards = sorted(list(set(weight_map.values())))
     print(f"Found {len(unique_shards)} shards to process.")
     
@@ -68,21 +68,82 @@ def compress_qwen_to_fractal_dna():
     total_params = 0
     compressed_params = 0
     
-    for shard_file in tqdm(unique_shards, desc="Processing Shards"):
-        print(f"\nDownloading shard: {shard_file}...")
-        try:
-            shard_path = snapshot_download(repo_id=model_id, allow_patterns=[shard_file])
-        except Exception as e:
-            print(f"Failed to download shard {shard_file}: {e}")
-            continue
+    BATCH_SIZE = 8
+    temp_dir = "./temp_shards"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Process in batches
+    for i in range(0, len(unique_shards), BATCH_SIZE):
+        batch_shards = unique_shards[i : i + BATCH_SIZE]
+        print(f"\n=== Processing Batch {i//BATCH_SIZE + 1}/{(len(unique_shards)+BATCH_SIZE-1)//BATCH_SIZE} ===")
+        print(f"Shards: {batch_shards}")
+        
+        # 1. Download Batch
+        batch_files = []
+        for shard_file in tqdm(batch_shards, desc="Downloading Batch"):
+            try:
+                # Download to specific temp dir
+                shard_path = snapshot_download(
+                    repo_id=model_id, 
+                    allow_patterns=[shard_file],
+                    local_dir=temp_dir,
+                    local_dir_use_symlinks=False # Ensure actual files for easy deletion
+                )
+                full_path = os.path.join(temp_dir, shard_file)
+                batch_files.append(full_path)
+            except Exception as e:
+                print(f"Failed to download {shard_file}: {e}")
+        
+        # 2. Collect Layers from Batch
+        layers_to_process = []
+        for full_shard_path in batch_files:
+            if not os.path.exists(full_shard_path): continue
             
-        # Locate the actual file
-        full_shard_path = None
-        for root, dirs, files in os.walk(shard_path):
-            if shard_file in files:
-                full_shard_path = os.path.join(root, shard_file)
-                break
-                
+            try:
+                with safe_open(full_shard_path, framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        tensor = f.get_tensor(key)
+                        layers_to_process.append((key, tensor))
+            except Exception as e:
+                print(f"Error reading {full_shard_path}: {e}")
+
+        # 3. Compress Batch in Parallel
+        from concurrent.futures import ThreadPoolExecutor
+        
+        def process_layer(item):
+            key, tensor = item
+            if len(tensor.shape) < 2:
+                return key, tensor.cpu(), tensor.nelement(), tensor.nelement()
+            
+            # Compress
+            dna = encoder.encode(tensor, num_transforms=16, iterations=200)
+            
+            orig_count = tensor.nelement()
+            comp_count = 16 * 7
+            return key, dna.to_json(), orig_count, comp_count
+
+        print(f"Compressing {len(layers_to_process)} layers in parallel...")
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(tqdm(executor.map(process_layer, layers_to_process), total=len(layers_to_process), desc="Compressing"))
+            
+        # Store results
+        for key, data, orig, comp in results:
+            fractal_brain[key] = data
+            total_params += orig
+            compressed_params += comp
+            
+        # 4. Cleanup Batch
+        print("Cleaning up batch files...")
+        for fpath in batch_files:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+        
+        # Clear RAM
+        del layers_to_process
+        del results
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
     # 4. Save Final DNA
     print("\n=== Compression Complete ===")
     print(f"Total Original Parameters: {total_params:,}")
