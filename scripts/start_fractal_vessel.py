@@ -68,7 +68,7 @@ def compress_qwen_to_fractal_dna():
     total_params = 0
     compressed_params = 0
     
-    BATCH_SIZE = 8
+    BATCH_SIZE = 4 # Reduced from 8 to prevent RAM OOM (4 shards ~ 20GB)
     temp_dir = "./temp_shards"
     os.makedirs(temp_dir, exist_ok=True)
     
@@ -95,8 +95,9 @@ def compress_qwen_to_fractal_dna():
                 print(f"Failed to download {shard_file}: {e}")
         
         # 2. Collect Layers from Batch
+        print("Loading layers into RAM...")
         layers_to_process = []
-        for full_shard_path in batch_files:
+        for full_shard_path in tqdm(batch_files, desc="Loading Shards"):
             if not os.path.exists(full_shard_path): continue
             
             try:
