@@ -68,7 +68,12 @@ def compress_qwen_to_fractal_dna():
     total_params = 0
     compressed_params = 0
     
-    BATCH_SIZE = 4 # Reduced from 8 to prevent RAM OOM (4 shards ~ 20GB)
+    BATCH_SIZE = 1 # Process 1 shard at a time to save RAM (5GB vs 40GB)
+    temp_dir = "./temp_shards"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    start_time_total = time.time()
+    processed_shards = 0
     temp_dir = "./temp_shards"
     os.makedirs(temp_dir, exist_ok=True)
     
@@ -181,6 +186,19 @@ def compress_qwen_to_fractal_dna():
             if os.path.exists(fpath):
                 os.remove(fpath)
         
+        # Update Progress & ETA
+        processed_shards += len(batch_shards)
+        elapsed = time.time() - start_time_total
+        avg_time = elapsed / processed_shards
+        remaining = len(unique_shards) - processed_shards
+        eta_seconds = avg_time * remaining
+        eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_seconds))
+        
+        print(f"Batch Complete. Progress: {processed_shards}/{len(unique_shards)}")
+        print(f"Avg Time per Shard: {avg_time:.1f}s. Estimated Time Remaining: {eta_str}")
+
+        import gc
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
