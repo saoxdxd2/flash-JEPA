@@ -103,34 +103,57 @@ def compress_qwen_to_fractal_dna():
                 with safe_open(full_shard_path, framework="pt", device="cpu") as f:
                     for key in f.keys():
                         tensor = f.get_tensor(key)
-                        layers_to_process.append((key, tensor))
+                        if len(tensor.shape) >= 2:
+                            layers_to_process.append((key, tensor))
+                        else:
+                             # Store 1D tensors raw
+                             fractal_brain[key] = tensor.cpu()
+                             total_params += tensor.nelement()
+                             compressed_params += tensor.nelement()
             except Exception as e:
                 print(f"Error reading {full_shard_path}: {e}")
 
-        # 3. Compress Batch in Parallel
-        from concurrent.futures import ThreadPoolExecutor
+        # 3. Compress Batch using GPU Parallelism (Batched Optimization)
+        # Group by shape
+        from collections import defaultdict
+        grouped_layers = defaultdict(list)
+        for key, tensor in layers_to_process:
+            grouped_layers[tensor.shape].append((key, tensor))
+            
+        print(f"Grouped {len(layers_to_process)} layers into {len(grouped_layers)} shape groups.")
         
-        def process_layer(item):
-            key, tensor = item
-            if len(tensor.shape) < 2:
-                return key, tensor.cpu(), tensor.nelement(), tensor.nelement()
+        for shape, items in grouped_layers.items():
+            # items is list of (key, tensor)
+            # Process in sub-batches if too large (e.g. > 32)
+            SUB_BATCH_SIZE = 32
             
-            # Compress
-            dna = encoder.encode(tensor, num_transforms=16, iterations=200)
-            
-            orig_count = tensor.nelement()
-            comp_count = 16 * 7
-            return key, dna.to_json(), orig_count, comp_count
-
-        print(f"Compressing {len(layers_to_process)} layers in parallel...")
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            results = list(tqdm(executor.map(process_layer, layers_to_process), total=len(layers_to_process), desc="Compressing"))
-            
-        # Store results
-        for key, data, orig, comp in results:
-            fractal_brain[key] = data
-            total_params += orig
-            compressed_params += comp
+            for i in range(0, len(items), SUB_BATCH_SIZE):
+                sub_items = items[i : i + SUB_BATCH_SIZE]
+                keys = [k for k, t in sub_items]
+                tensors = [t for k, t in sub_items]
+                
+                # Stack tensors: [B, H, W]
+                batch_tensor = torch.stack(tensors)
+                
+                # Encode Batch
+                # print(f"  Encoding batch of {len(tensors)} layers with shape {shape}...")
+                dna_list = encoder.encode_batch(batch_tensor, num_transforms=16, iterations=200)
+                
+                # Store results
+                for k, dna, t in zip(keys, dna_list, tensors):
+                    fractal_brain[k] = dna.to_json()
+                    total_params += t.nelement()
+                    compressed_params += 16 * 7
+                
+                # Cleanup
+                del batch_tensor
+                del dna_list
+                
+        # Clear RAM
+        del layers_to_process
+        del grouped_layers
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
             
         # 4. Cleanup Batch
         print("Cleaning up batch files...")
