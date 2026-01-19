@@ -124,8 +124,26 @@ def compress_qwen_to_fractal_dna():
         
         for shape, items in grouped_layers.items():
             # items is list of (key, tensor)
-            # Process in sub-batches if too large
-            SUB_BATCH_SIZE = 8 # Reduced from 32 to prevent OOM
+            
+            # Dynamic Batch Sizing
+            # Calculate memory per layer (approx)
+            # Tensor: H*W*4 bytes
+            # Gradients/Optimizer: ~3-4x params
+            # Monte Carlo overhead: Fixed small buffer
+            H, W = shape
+            bytes_per_layer = H * W * 4
+            estimated_mem_per_layer = bytes_per_layer * 6 # Safety factor for optimizer states + gradients
+            
+            if torch.cuda.is_available():
+                free_mem, total_mem = torch.cuda.mem_get_info()
+                target_mem = free_mem * 0.9 # Use up to 90% of free memory
+                
+                # Ensure we don't divide by zero or get 0 batch
+                calc_batch_size = int(target_mem / (estimated_mem_per_layer + 1e-6))
+                SUB_BATCH_SIZE = max(1, min(calc_batch_size, 64)) # Cap at 64 for stability
+                print(f"  Shape {shape}: Free VRAM {free_mem/1e9:.2f}GB. Est. Layer Mem {estimated_mem_per_layer/1e6:.2f}MB. Dynamic Batch: {SUB_BATCH_SIZE}")
+            else:
+                SUB_BATCH_SIZE = 8
             
             for i in range(0, len(items), SUB_BATCH_SIZE):
                 sub_items = items[i : i + SUB_BATCH_SIZE]
