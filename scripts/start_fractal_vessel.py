@@ -103,10 +103,10 @@ def compress_qwen_to_fractal_dna():
                 with safe_open(full_shard_path, framework="pt", device="cpu") as f:
                     for key in f.keys():
                         tensor = f.get_tensor(key)
-                        if len(tensor.shape) >= 2:
+                        if len(tensor.shape) == 2:
                             layers_to_process.append((key, tensor))
                         else:
-                             # Store 1D tensors raw
+                             # Store 1D, 3D, 4D tensors raw
                              fractal_brain[key] = tensor.cpu()
                              total_params += tensor.nelement()
                              compressed_params += tensor.nelement()
