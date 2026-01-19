@@ -98,22 +98,46 @@ class FractalEncoder:
             # The target should be a fixed point of the operator T(x) = sum(p_i * w_i(x))
             # So we want T(target) approx target.
             
-            # Prepare batch of affine matrices
-            # params: [a, b, c, d, e, f] -> [[a, b, e], [c, d, f]]
-            theta = params.view(num_transforms, 2, 3)
+            # Memory Optimization:
+            # Instead of replicating target_batch num_transforms times (which causes OOM for large matrices),
+            # we iterate and accumulate the weighted sum.
             
-            # Grid sample expects normalized coordinates [-1, 1]
-            # We expand target to [num_transforms, 1, H, W]
-            target_batch = normalized_target.unsqueeze(0).unsqueeze(0).repeat(num_transforms, 1, 1, 1)
+            weighted_sum = torch.zeros_like(normalized_target)
+            probs = torch.softmax(probs_logits, dim=0)
             
-            grid = torch.nn.functional.affine_grid(theta, target_batch.size(), align_corners=False)
-            transformed_batch = torch.nn.functional.grid_sample(target_batch, grid, align_corners=False)
+            # Reshape params for affine_grid: [N, 2, 3]
+            theta_all = params.view(num_transforms, 2, 3)
             
-            # Weighted sum of transformed copies
-            # transformed_batch: [num_transforms, 1, H, W]
-            # probs: [num_transforms]
+            # We process transforms in chunks to balance speed and memory
+            # For very large matrices, chunk_size=1 is safest.
+            chunk_size = 1 
             
-            weighted_sum = torch.sum(transformed_batch * probs.view(-1, 1, 1, 1), dim=0).squeeze()
+            for t_idx in range(0, num_transforms, chunk_size):
+                end_idx = min(t_idx + chunk_size, num_transforms)
+                current_batch_size = end_idx - t_idx
+                
+                # Get params for this chunk
+                theta_chunk = theta_all[t_idx:end_idx]
+                
+                # Expand target for this chunk only
+                # target_batch: [chunk_size, 1, H, W]
+                target_batch = normalized_target.unsqueeze(0).unsqueeze(0).repeat(current_batch_size, 1, 1, 1)
+                
+                # Grid Sample
+                grid = torch.nn.functional.affine_grid(theta_chunk, target_batch.size(), align_corners=False)
+                transformed_chunk = torch.nn.functional.grid_sample(target_batch, grid, align_corners=False)
+                
+                # Accumulate weighted sum
+                # transformed_chunk: [chunk_size, 1, H, W]
+                # probs[t_idx:end_idx]: [chunk_size]
+                
+                chunk_probs = probs[t_idx:end_idx].view(-1, 1, 1, 1)
+                weighted_chunk_sum = torch.sum(transformed_chunk * chunk_probs, dim=0).squeeze(0).squeeze(0)
+                
+                weighted_sum = weighted_sum + weighted_chunk_sum
+                
+                # Free memory
+                del target_batch, grid, transformed_chunk, weighted_chunk_sum
             
             loss = torch.nn.functional.mse_loss(weighted_sum, normalized_target)
             

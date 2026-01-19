@@ -128,6 +128,12 @@ def compress_qwen_to_fractal_dna():
                 total_params += orig_count
                 compressed_params += comp_count
                 
+                # Memory Cleanup
+                del tensor
+                del dna
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
         # Clean up shard to free disk/ram?
         # Colab has disk space, but we should be careful.
         # os.remove(full_shard_path) # Optional

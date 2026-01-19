@@ -65,16 +65,35 @@ class NeuralRibosome(nn.Module):
         
         # Iteration Loop (The "Growth" Process)
         for _ in range(iterations):
-            # Apply all transforms
-            # We expand canvas to [num_transforms, 1, H, W]
-            canvas_batch = canvas.repeat(num_transforms, 1, 1, 1)
+            # Memory Optimization: Sequential Accumulation
+            new_canvas = torch.zeros_like(canvas)
             
-            grid = F.affine_grid(theta, canvas_batch.size(), align_corners=False)
-            transformed_batch = F.grid_sample(canvas_batch, grid, align_corners=False)
+            # Reshape theta for affine_grid: [N, 2, 3]
+            # theta is already [N, 2, 3]
             
-            # Weighted Sum (Superposition)
-            # canvas = sum(w_i(canvas) * p_i)
-            canvas = torch.sum(transformed_batch * probs.view(-1, 1, 1, 1), dim=0)
+            chunk_size = 1
+            
+            for t_idx in range(0, num_transforms, chunk_size):
+                end_idx = min(t_idx + chunk_size, num_transforms)
+                current_batch_size = end_idx - t_idx
+                
+                theta_chunk = theta[t_idx:end_idx]
+                
+                # Expand canvas for this chunk
+                # canvas: [1, 1, H, W] -> [chunk_size, 1, H, W]
+                canvas_batch = canvas.repeat(current_batch_size, 1, 1, 1)
+                
+                grid = F.affine_grid(theta_chunk, canvas_batch.size(), align_corners=False)
+                transformed_chunk = F.grid_sample(canvas_batch, grid, align_corners=False)
+                
+                chunk_probs = probs[t_idx:end_idx].view(-1, 1, 1, 1)
+                weighted_chunk_sum = torch.sum(transformed_chunk * chunk_probs, dim=0).unsqueeze(0)
+                
+                new_canvas = new_canvas + weighted_chunk_sum
+                
+                del canvas_batch, grid, transformed_chunk, weighted_chunk_sum
+            
+            canvas = new_canvas
             
         # Post-processing
         # Rescale to original range (assuming we stored scale somewhere, or just use base_val as min)
