@@ -23,7 +23,7 @@ INITIAL_CORTISOL = 0.0      # No stress
 
 # Baseline and Decay
 BASELINE_DOPAMINE = 0.2     # Resting dopamine level
-DECAY_RATE = 0.01           # General homeostatic decay
+DECAY_RATE = 0.10           # Strong homeostasis to prevent collapse
 
 # Energy/Metabolism
 INITIAL_ENERGY = 100.0      # Full energy
@@ -34,7 +34,7 @@ STARVATION_THRESHOLD = 20.0 # Energy level that triggers stress
 
 # Dopamine Dynamics
 DOPAMINE_RPE_SENSITIVITY = 0.5     # How much RPE affects dopamine
-DOPAMINE_CORTISOL_SUPPRESSION = 0.3  # Cortisol dampens dopamine
+DOPAMINE_CORTISOL_SUPPRESSION = 0.1  # Reduced from 0.3 to prevent "depression spiral"
 SEROTONIN_BRAKE_THRESHOLD = 0.5    # Serotonin level that starts braking
 SEROTONIN_BRAKE_STRENGTH = 0.5     # How much serotonin limits dopamine spikes
 
@@ -50,7 +50,7 @@ CORTISOL_EFFORT_WEIGHT = 0.01
 CORTISOL_STARVATION_WEIGHT = 0.1
 CORTISOL_AROUSAL_AMPLIFICATION = 0.05
 CORTISOL_DOPAMINE_RELIEF = 0.02
-CORTISOL_DECAY = 0.98  # Slower decay for chronic stress
+CORTISOL_DECAY = 0.95  # Faster decay (Resilience)
 
 # Serotonin Dynamics
 SEROTONIN_STRESS_THRESHOLD = 0.4   # Cortisol level that depletes serotonin
@@ -197,7 +197,15 @@ class NeurotransmitterSystem:
         dopamine_delta = reward_prediction_error * self.dopamine_params[0]
         serotonin_brake = torch.relu(serotonin - self.dopamine_params[2]) * self.dopamine_params[3]
         
-        dopamine_new = dopamine + (dopamine_delta - (cortisol * self.dopamine_params[1]) - serotonin_brake)
+        # FIX: Use Multiplicative Suppression instead of Subtractive
+        # This prevents dopamine from being pushed below zero and getting "stuck"
+        suppression_factor = (cortisol * self.dopamine_params[1]) + serotonin_brake
+        suppression_factor = torch.clamp(suppression_factor, 0.0, 0.95) # Cap at 95% suppression
+        
+        dopamine_new = dopamine + dopamine_delta
+        dopamine_new = dopamine_new * (1.0 - suppression_factor)
+        
+        # Homeostatic Recovery
         dopamine_new += (self.baseline_dopamine - dopamine_new) * self.decay_rate
         
         # --- Norepinephrine Dynamics ---

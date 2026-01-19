@@ -107,7 +107,8 @@ def compress_qwen_to_fractal_dna():
                             layers_to_process.append((key, tensor))
                         else:
                              # Store 1D, 3D, 4D tensors raw
-                             fractal_brain[key] = tensor.cpu()
+                             # Optimization: Store as FP16 to save space
+                             fractal_brain[key] = tensor.half().cpu()
                              total_params += tensor.nelement()
                              compressed_params += tensor.nelement()
             except Exception as e:
@@ -179,9 +180,6 @@ def compress_qwen_to_fractal_dna():
             if os.path.exists(fpath):
                 os.remove(fpath)
         
-        # Clear RAM
-        del layers_to_process
-        del results
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
