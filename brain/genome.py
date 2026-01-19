@@ -694,6 +694,15 @@ class Genome:
     DREAM_INTERVAL = 5
     TRAIN_SAVE_INTERVAL = 2
     
+    # --- Neuroplasticity Constants ---
+    ENABLE_NEUROPLASTICITY = True
+    MIN_HIDDEN_SIZE = 4096
+    MAX_HIDDEN_SIZE = 16384 # Can be overridden by RAM check
+    GROWTH_TRIGGER_SURPRISE = 0.8 # High surprise -> Grow
+    PRUNE_TRIGGER_STABILITY = 0.1 # Low surprise -> Prune
+    GROWTH_STEP_SIZE = 512 # Neurons to add per growth event
+    PRUNE_STEP_SIZE = 256 # Neurons to remove per prune event
+    
     def __init__(self):
         # =====================================================================
         # STRUCTURAL GENES (Backward Compatible)
@@ -841,6 +850,26 @@ class Genome:
         
         # Genomic Imprinting (parent-of-origin effects)
         self.imprinting = GenomicImprinting()
+        
+    def __setstate__(self, state):
+        """Handle unpickling of old genomes."""
+        self.__dict__.update(state)
+        
+        # Ensure _gene_lookup exists (Backward Compatibility)
+        if not hasattr(self, '_gene_lookup'):
+            self._gene_lookup = {}
+            if hasattr(self, 'chromosomes'):
+                for chrom in self.chromosomes.values():
+                    self._gene_lookup.update(chrom.genes)
+                    
+        # Ensure other new systems exist
+        if not hasattr(self, 'grn'): self.grn = GeneRegulatoryNetwork()
+        if not hasattr(self, 'mirnas'): self.mirnas = {}
+        if not hasattr(self, 'telomeres'): self.telomeres = TelomereSystem()
+        if not hasattr(self, 'dna_repair'): self.dna_repair = DNARepairSystem()
+        if not hasattr(self, 'transposon'): self.transposon = Transposon()
+        if not hasattr(self, 'splicing'): self.splicing = AlternativeSplicing()
+        if not hasattr(self, 'imprinting'): self.imprinting = GenomicImprinting()
     
     # =========================================================================
     # GENE ACCESS (for modules to read)

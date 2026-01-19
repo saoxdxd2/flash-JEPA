@@ -19,10 +19,12 @@ def get_memory_stats():
     """
     Returns system and GPU memory statistics in MB.
     """
+    process = psutil.Process(os.getpid())
     stats = {
         "sys_total": psutil.virtual_memory().total / (1024 * 1024),
         "sys_available": psutil.virtual_memory().available / (1024 * 1024),
-        "sys_percent": psutil.virtual_memory().percent
+        "sys_percent": psutil.virtual_memory().percent,
+        "rss_mb": process.memory_info().rss / (1024 * 1024)
     }
     
     if torch.cuda.is_available():

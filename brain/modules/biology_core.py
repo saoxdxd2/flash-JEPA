@@ -82,9 +82,20 @@ class NeurotransmitterSystem:
         
         # Energy (Scalar)
         self.energy = INITIAL_ENERGY
+        self.surprise = 0.0 # Track last surprise level
         
         # Pre-fetch Genes / Constants into Tensors for fast computation
         self._init_parameters()
+
+    def reset(self):
+        """Resets neurochemistry to initial baseline levels."""
+        self.state = torch.tensor([
+            INITIAL_DOPAMINE,
+            INITIAL_SEROTONIN,
+            INITIAL_NOREPINEPHRINE,
+            INITIAL_CORTISOL
+        ], device=self.device, dtype=torch.float32)
+        self.energy = INITIAL_ENERGY
         
     def _init_parameters(self):
         """Pre-load genes into tensors to avoid getattr overhead in loop."""
@@ -159,6 +170,12 @@ class NeurotransmitterSystem:
         """
         # Ensure inputs are tensors or floats
         if isinstance(reward_prediction_error, torch.Tensor): reward_prediction_error = reward_prediction_error.item()
+        
+        # Store surprise for logging
+        if isinstance(surprise, torch.Tensor):
+            self.surprise = surprise.item()
+        else:
+            self.surprise = float(surprise)
         
         # --- Metabolic Cost ---
         energy_drain = self.metabolic_rate + (effort * self.effort_energy_cost)

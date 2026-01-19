@@ -12,16 +12,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-
+from brain.modules.sparse_layers import SparseLinear, DEFAULT_SPARSITY, MIN_NON_ZERO_CONNECTIONS, SPROUTING_INIT_SCALE, PRUNE_THRESHOLD
+from brain.modules.neural_vm import NeuralVirtualizationLayer
 
 # === CONFIGURATION CONSTANTS ===
 # These control the architecture and behavior of the holographic brain
-
-# Sparse Linear Layer Defaults
-DEFAULT_SPARSITY = 0.99          # Default connection sparsity (99% sparse)
-MIN_NON_ZERO_CONNECTIONS = 1     # Minimum connections to maintain
-SPROUTING_INIT_SCALE = 0.01     # Scale for new connection initialization
-PRUNE_THRESHOLD = 0.01          # Weight magnitude threshold for pruning
 
 # Holographic Encoder
 ENCODER_BASE_RESOLUTION = 16    # Base resolution for 3D encoding
@@ -41,252 +36,93 @@ TAU_STRATEGY_RANGE = (1.0, 10.0) # Slow strategies: 1-10s
 ROUTER_BLOCK_SIZE = 64
 
 # Default chemical state (dopamine, serotonin, norepinephrine, cortisol)
-DEFAULT_CHEMICALS = [0.5, 0.5, 0.2, 0.0]
-
 # SSI Learning
 SSI_JEPA_CONSISTENCY_WEIGHT = 0.1
 
-class SparseLinear(nn.Module):
-    """
-    Sparse Linear Layer using CSR format for CPU efficiency.
-    W (In, Out) is stored as a sparse matrix.
-    """
-    def __init__(self, in_features, out_features, sparsity=0.99):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.sparsity = sparsity
-        
-        # Initialize sparse weights
-        num_non_zero = int(in_features * out_features * (1 - sparsity))
-        num_non_zero = max(num_non_zero, MIN_NON_ZERO_CONNECTIONS)
-        
-        # Generate random indices
-        indices = torch.randint(0, in_features, (2, num_non_zero))
-        indices[1] = torch.randint(0, out_features, (num_non_zero,))
-        
-        # Coalesce to remove duplicates immediately
-        # We use a temporary tensor to do this
-        temp_vals = torch.randn(num_non_zero)
-        temp_coo = torch.sparse_coo_tensor(indices, temp_vals, (in_features, out_features)).coalesce()
-        
-        # Use the coalesced indices and values size
-        self.register_buffer('indices', temp_coo.indices())
-        
-        real_num_non_zero = self.indices.shape[1]
-        self.values = nn.Parameter(torch.randn(real_num_non_zero) * (1.0 / np.sqrt(in_features)))
-        self.bias = nn.Parameter(torch.zeros(out_features))
-        
-        # CSR Cache (for CPU efficiency)
-        self.register_buffer('crow_indices', None)
-        self.register_buffer('col_indices', None)
-        
-        # Activity tracking for sprouting (Non-persistent to avoid shape mismatch on load)
-        self.register_buffer('activity_in', torch.zeros(in_features), persistent=False)
-        self.register_buffer('activity_out', torch.zeros(out_features), persistent=False)
-        
-    def forward(self, x):
-        # x: (Batch, In)
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        
-        if self.crow_indices is None or self.crow_indices.device != x.device:
-            # Reconstruct and cache CSR structure
-            with torch.no_grad():
-                indices = self.indices.to(x.device)
-                values = self.values.to(x.device).detach()
-                # Use detached values just to get the structure
-                W_coo = torch.sparse_coo_tensor(
-                    indices, values, (self.in_features, self.out_features)
-                ).coalesce()
-                W_csr = W_coo.to_sparse_csr()
-                self.register_buffer('crow_indices', W_csr.crow_indices(), persistent=False)
-                self.register_buffer('col_indices', W_csr.col_indices(), persistent=False)
-            
-        # Reconstruct Sparse CSR Tensor using CURRENT values (Autograd friendly)
-        W = torch.sparse_csr_tensor(
-            self.crow_indices,
-            self.col_indices,
-            self.values,
-            size=(self.in_features, self.out_features),
-            device=x.device
-        )
-        
-        # res = x @ weight + bias
-        res = torch.addmm(self.bias.unsqueeze(0), x, W)
-        
-        # Track activity (Hebbian)
-        if self.training:
-            with torch.no_grad():
-                self.activity_in += x.abs().mean(0)
-                self.activity_out += res.abs().mean(0)
-                
-        return res
-
-    def to_dense(self):
-        """Converts to a standard nn.Linear for ONNX export."""
-        linear = nn.Linear(self.in_features, self.out_features)
-        with torch.no_grad():
-            # Ensure indices and values are on the same device
-            indices = self.indices.to(self.values.device)
-            W_coo = torch.sparse_coo_tensor(
-                indices, self.values, (self.in_features, self.out_features)
-            ).coalesce()
-            linear.weight.data = W_coo.to_dense().t()
-            linear.bias.data = self.bias.data.clone()
-        return linear
-
-    def forward_onnx(self, x):
-        """Stateless dense forward pass for ONNX export."""
-        # Use traceable dense weight creation
-        W_dense = torch.zeros(self.in_features, self.out_features, device=self.values.device)
-        # indices[0] is in_features, indices[1] is out_features
-        W_dense.index_put_((self.indices[0], self.indices[1]), self.values)
-        return torch.addmm(self.bias.unsqueeze(0), x, W_dense)
-
-    def sprout(self, num_new=100):
-        """Adds new connections between highly active neurons."""
-        print(f"SparseLinear: Sprouting {num_new} new connections...")
-        with torch.no_grad():
-            # Find top active in/out neurons
-            top_in = torch.topk(self.activity_in, min(num_new, self.in_features)).indices
-            top_out = torch.topk(self.activity_out, min(num_new, self.out_features)).indices
-            
-            # Create new indices
-            new_idx = torch.stack([
-                top_in[torch.randint(0, len(top_in), (num_new,))],
-                top_out[torch.randint(0, len(top_out), (num_new,))]
-            ])
-            
-            # Append to existing indices
-            self.indices = torch.cat([self.indices, new_idx.to(self.indices.device)], dim=1)
-            
-            # Initialize new values
-            new_vals = torch.randn(num_new, device=self.values.device) * SPROUTING_INIT_SCALE
-            self.values = nn.Parameter(torch.cat([self.values, new_vals]))
-            
-            # Reset CSR cache
-            self.crow_indices = None
-            self.col_indices = None
-            # Reset activity
-            self.activity_in.zero_()
-            self.activity_out.zero_()
-
-    def prune(self, threshold=PRUNE_THRESHOLD):
-        """Removes connections with low weights."""
-        with torch.no_grad():
-            mask = self.values.abs() > threshold
-            if mask.any():
-                print(f"SparseLinear: Pruning {len(self.values) - mask.sum()} weak connections...")
-                self.indices = self.indices[:, mask]
-                self.values = nn.Parameter(self.values[mask])
-                # Reset CSR cache
-                self.crow_indices = None
-                self.col_indices = None
-
-    def resize(self, in_features=None, out_features=None):
-        """Resizes the layer while attempting to preserve existing weights."""
-        if in_features is None: in_features = self.in_features
-        if out_features is None: out_features = self.out_features
-        
-        if in_features == self.in_features and out_features == self.out_features:
-            return
-            
-        print(f"SparseLinear: Resizing ({self.in_features}, {self.out_features}) -> ({in_features}, {out_features})")
-        
-        # Create new indices and values
-        num_non_zero = int(in_features * out_features * (1 - self.sparsity))
-        num_non_zero = max(num_non_zero, MIN_NON_ZERO_CONNECTIONS)
-        
-        new_indices = torch.randint(0, in_features, (2, num_non_zero))
-        new_indices[1] = torch.randint(0, out_features, (num_non_zero,))
-        new_values = torch.randn(num_non_zero) * (1.0 / np.sqrt(in_features))
-        new_bias = torch.zeros(out_features)
-        
-        self.in_features = in_features
-        self.out_features = out_features
-        self.indices = new_indices.to(self.indices.device)
-        self.values = nn.Parameter(new_values.to(self.values.device))
-        self.bias = nn.Parameter(new_bias.to(self.bias.device))
-        
-        # Reset CSR cache
-        self.crow_indices = None
-        self.col_indices = None
-        
-        # Resize activity buffers
-        self.register_buffer('activity_in', torch.zeros(in_features, device=self.indices.device), persistent=False)
-        self.register_buffer('activity_out', torch.zeros(out_features, device=self.indices.device), persistent=False)
-
 class HierarchicalBlock(nn.Module):
     """
-    Encapsulates a single level of the hierarchy (Sensory, Recurrent, Predictor, Router).
+    Encapsulates a single level of the hierarchy, implemented as a Cluster of Neural Processing Units (NPUs).
     """
     def __init__(self, in_size, hidden_size, tau_range, router_blocks=64):
         super().__init__()
         self.in_size = in_size
         self.hidden_size = hidden_size
-        self.router_blocks = router_blocks
         
-        self.W = SparseLinear(in_size, hidden_size)
-        self.R = SparseLinear(hidden_size, hidden_size)
-        self.P = SparseLinear(hidden_size, hidden_size)
+        # Neural Virtualization Layer (The Cluster)
+        # We default to 64 max NPUs per block for now.
+        self.vm = NeuralVirtualizationLayer(in_size, hidden_size, max_npus=64, memory_size=64)
         
-        self.router = nn.Linear(in_size, router_blocks)
+        # Predictor (Still useful for forward prediction)
+        self.P = nn.Linear(hidden_size, hidden_size)
         
-        # Time constants
+        # Time constants (Managed by VM implicitly via gating, but we keep explicit tau for leaky integration of the block output)
         min_tau, max_tau = tau_range
         self.tau = nn.Parameter(torch.rand(hidden_size) * (max_tau - min_tau) + min_tau)
         
+        # State placeholders
+        self.memory_state = None
+        
     def forward(self, x, h_prev, gate, dt=0.1):
-        # Router
-        r_gate = torch.sigmoid(self.router(x))
-        mask = r_gate.repeat_interleave(64, dim=1)[:, :self.hidden_size]
+        # x: [Batch, In]
+        # h_prev: [Batch, Hidden]
         
-        # Dynamics
-        sensory = self.W(x) * mask
-        rec = self.R(h_prev)
-        target = torch.tanh(sensory + rec)
+        # Run the Neural VM
+        # vm_out: [Batch, Hidden] - Aggregated output of NPUs
+        # h_new_internal: [Batch, Hidden] - New register states
+        # mem_new: [Batch, Mem_Size, Mem_Dim] - New RAM state
         
-        # Leaky Update
-        h_new = h_prev + gate * (target - h_prev) * (dt / self.tau)
+        if self.memory_state is None or self.memory_state.shape[0] != x.shape[0]:
+             self.memory_state = torch.zeros(x.shape[0], self.vm.memory_size, self.vm.memory_dim, device=x.device)
+             
+        vm_out, h_new_internal, self.memory_state = self.vm(x, h_prev, self.memory_state)
         
-        # Prediction
-        pred = self.P(h_new)
+        # Leaky Update? 
+        # The VM has its own dynamics. We can apply a global gate to the *output*.
+        # Let's say the block output is a leaky integration of the VM output.
+        # But we need to return the *state* for the next step.
+        # The state is h_new_internal (3D).
         
-        return h_new, pred
+        # Prediction uses the aggregated output (2D)
+        pred = self.P(vm_out)
+        
+        # Return (State_3D, Output_2D, Prediction)
+        # But signature is h_new, pred.
+        # We'll return h_new_internal as h_new.
+        # But we also need the 2D output for the heads in the Brain.
+        # Let's return h_new_internal (State) and pack (vm_out, pred) as the second return?
+        # Or change signature.
+        
+        return h_new_internal, vm_out, pred
         
     def forward_onnx(self, x, h_prev, gate, dt=0.1):
-        # Router
-        r_gate = torch.sigmoid(self.router(x))
-        mask = r_gate.repeat_interleave(64, dim=1)[:, :self.hidden_size]
-        
-        # Dynamics (Dense for ONNX)
-        sensory = self.W.forward_onnx(x) * mask
-        rec = self.R.forward_onnx(h_prev)
-        target = torch.tanh(sensory + rec)
-        
-        h_new = h_prev + gate * (target - h_prev) * (dt / self.tau)
-        pred = self.P.forward_onnx(h_new)
-        
+        # Simplified for ONNX: Just run VM and update
+        if self.memory_state is None:
+             self.memory_state = torch.zeros(x.shape[0], self.vm.memory_size, self.vm.memory_dim, device=x.device)
+             
+        vm_out, h_new_internal, self.memory_state = self.vm(x, h_prev, self.memory_state)
+        h_new = h_prev + gate * (vm_out - h_prev) * (dt / self.tau)
+        pred = self.P(h_new)
         return h_new, pred
 
     def resize(self, in_size=None, hidden_size=None):
         if in_size is not None: self.in_size = in_size
         if hidden_size is not None: self.hidden_size = hidden_size
         
-        self.W.resize(in_features=self.in_size, out_features=self.hidden_size)
-        self.R.resize(in_features=self.hidden_size, out_features=self.hidden_size)
-        self.P.resize(in_features=self.hidden_size, out_features=self.hidden_size)
+        # Resize VM? 
+        # For now, we just re-init if sizes change drastically, or we could implement smart resizing in VM.
+        # The VM has a resize method for NPUs, but changing hidden_size implies changing register size.
+        # Let's re-init for simplicity in this prototype.
+        self.vm = NeuralVirtualizationLayer(self.in_size, self.hidden_size, max_npus=self.vm.max_npus, memory_size=self.vm.memory_size).to(next(self.parameters()).device)
+        self.P = nn.Linear(self.hidden_size, self.hidden_size).to(next(self.parameters()).device)
         
         device = self.tau.device
         if len(self.tau) != self.hidden_size:
-            # Resize Tau (Random re-init for simplicity on resize, or preserve?)
-            # Preserving is better but complex. For now, re-init consistent with constructor.
-            # Assuming resize happens rarely and mostly during growth.
-            self.tau = nn.Parameter(torch.rand(self.hidden_size, device=device) * 0.1 + 0.01) # Default range, should pass in range
-            
-        if self.router.in_features != self.in_size:
-            self.router = nn.Linear(self.in_size, self.router_blocks).to(device)
+            self.tau = nn.Parameter(torch.rand(self.hidden_size, device=device) * 0.1 + 0.01)
+
+    def detach_state(self):
+        """Detach internal states from the computation graph."""
+        if self.memory_state is not None:
+            self.memory_state = self.memory_state.detach()
 
 
 class NeuromodulatedHolographicBrain(nn.Module):
@@ -355,16 +191,16 @@ class NeuromodulatedHolographicBrain(nn.Module):
         self.h_concept = None
         self.h_strategy = None
         
-        self._init_routing_specialization()
+        # self._init_routing_specialization() # Removed as we use Neural VM now
         
-    def _init_routing_specialization(self):
-        with torch.no_grad():
-            for module in [self.reflex.W, self.concept.W, self.strategy.W]:
-                num_blocks = module.out_features // 64
-                if num_blocks > 0:
-                    for b in range(num_blocks):
-                        mask = (module.indices[1] >= b*64) & (module.indices[1] < (b+1)*64)
-                        module.values.data[mask] += torch.randn(mask.sum()) * 0.01 * (b / num_blocks)
+    # def _init_routing_specialization(self):
+    #     with torch.no_grad():
+    #         for module in [self.reflex.W, self.concept.W, self.strategy.W]:
+    #             num_blocks = module.out_features // 64
+    #             if num_blocks > 0:
+    #                 for b in range(num_blocks):
+    #                     mask = (module.indices[1] >= b*64) & (module.indices[1] < (b+1)*64)
+    #                     module.values.data[mask] += torch.randn(mask.sum()) * 0.01 * (b / num_blocks)
         
     def forward(self, input_vector, dt=0.1, reward=0.0, chemicals=None, train_internal_rl=True, memory_input=None):
         input_vector = input_vector.float()
@@ -437,7 +273,7 @@ class NeuromodulatedHolographicBrain(nn.Module):
         
         flash_data = (flash_actions, confidence, p_reflex, p_concept, p_strategy, self.h_reflex, self.h_concept, self.h_strategy)
         return actions, value, energy, flash_data
-
+        
     def forward_onnx(self, input_vector, chemicals, h_reflex, h_concept, h_strategy, dt=0.1):
         batch_size = input_vector.shape[0]
 
@@ -473,6 +309,212 @@ class NeuromodulatedHolographicBrain(nn.Module):
         
         return actions, value, energy, (flash_actions, confidence, p_reflex, p_concept, p_strategy, next_h_reflex, next_h_concept, next_h_strategy), (next_h_reflex, next_h_concept, next_h_strategy)
 
+    def resize_hidden(self, new_hidden_size):
+        """
+        Dynamically resizes the brain's hidden layers.
+        """
+        print(f"NeuromodulatedHolographicBrain: Resizing hidden_size {self.hidden_size} -> {new_hidden_size}")
+        self.hidden_size = new_hidden_size
+        
+        # Recalculate hierarchical sizes
+        r_size = new_hidden_size // 4
+        s_size = new_hidden_size // 4
+        c_size = new_hidden_size - (r_size + s_size)
+        
+        self.reflex.resize(hidden_size=r_size)
+        self.concept.resize(in_size=r_size, hidden_size=c_size)
+        self.strategy.resize(in_size=c_size, hidden_size=s_size)
+        self.input_projection = nn.Linear(input_size, self.base_res**3 * 4)
+        
+        # --- 1.5 Thalamic Gate ---
+        if self.memory_size is not None and self.memory_size > 0:
+            self.memory_projection = nn.Linear(self.memory_size, self.encoded_size * 4)
+            self.thalamus_gate = nn.Sequential(
+                nn.Linear(self.encoded_size * 4 * 2 + 4, 32),
+                nn.Tanh(),
+                nn.Linear(32, 1),
+                nn.Sigmoid()
+            )
+        else:
+            self.memory_projection = None
+            self.thalamus_gate = None
+        
+        # --- 2. Hierarchical Dimensions ---
+        r_size = hidden_size // 4
+        s_size = hidden_size // 4
+        c_size = hidden_size - (r_size + s_size)
+        
+        # --- 3. Hierarchical Blocks ---
+        self.reflex = HierarchicalBlock(self.encoded_size, r_size, TAU_REFLEX_RANGE)
+        self.concept = HierarchicalBlock(r_size, c_size, TAU_CONCEPT_RANGE)
+        self.strategy = HierarchicalBlock(c_size, s_size, TAU_STRATEGY_RANGE)
+        
+        # --- 4. Neuromodulated Gating ---
+        # Meta controller takes flattened 4D input
+        self.meta_controller = nn.Sequential(
+            nn.Linear(self.encoded_size * 4 + 4, 64),
+            nn.Tanh(),
+            nn.Linear(64, 3) 
+        )
+        
+        # --- 5. Heads ---
+        # Heads take flattened 4D hidden states
+        self.flash_head = nn.Linear(r_size * 4, output_size)
+        self.flash_confidence = nn.Linear(r_size * 4, 1)
+        
+        self.decoder = nn.Linear(hidden_size * 4, output_size)
+        self.intent_gate = nn.Linear(hidden_size * 4, 1)
+        self.critic = nn.Linear(hidden_size * 4, 1)
+        
+        # State
+        self.h_reflex = None
+        self.h_concept = None
+        self.h_strategy = None
+        
+        self._init_routing_specialization()
+        
+    def _init_routing_specialization(self):
+        with torch.no_grad():
+            for module in [self.reflex.W, self.concept.W, self.strategy.W]:
+                # Handle SparseQuaternionLinear
+                sub_modules = [module.r_weight, module.i_weight, module.j_weight, module.k_weight]
+                
+                for sub in sub_modules:
+                    num_blocks = sub.out_features // 64
+                    if num_blocks > 0:
+                        for b in range(num_blocks):
+                            mask = (sub.indices[1] >= b*64) & (sub.indices[1] < (b+1)*64)
+                            sub.values.data[mask] += torch.randn(mask.sum()) * 0.01 * (b / num_blocks)
+        
+    def forward(self, input_vector, dt=0.1, reward=0.0, chemicals=None, train_internal_rl=True, memory_input=None):
+        input_vector = input_vector.float()
+        if chemicals is not None: chemicals = chemicals.float()
+        if memory_input is not None: memory_input = memory_input.float()
+        if input_vector.dim() == 1: input_vector = input_vector.unsqueeze(0)
+        batch_size = input_vector.shape[0]
+        
+        if chemicals is not None:
+            if chemicals.dim() == 1:
+                chemicals = chemicals.unsqueeze(0)
+            if chemicals.shape[0] != batch_size:
+                chemicals = chemicals.repeat(batch_size, 1)
+        
+        # Init States
+        if self.h_reflex is None or self.h_reflex.shape[0] != batch_size:
+            # [Batch, Max_NPUs, Reg_Size]
+            self.h_reflex = torch.zeros(batch_size, self.reflex.vm.max_npus, self.reflex.vm.npu_register_size, device=input_vector.device)
+            self.h_concept = torch.zeros(batch_size, self.concept.vm.max_npus, self.concept.vm.npu_register_size, device=input_vector.device)
+            self.h_strategy = torch.zeros(batch_size, self.strategy.vm.max_npus, self.strategy.vm.npu_register_size, device=input_vector.device)
+            
+        # --- 1. Holographic Encoding ---
+        # Project to base_res^3
+        x = self.input_projection(input_vector)
+        # Reshape to [Batch, 1, D, H, W]
+        x = x.view(batch_size, 1, self.base_res, self.base_res, self.base_res)
+        
+        curr = x
+        for layer in self.encoder_levels:
+            curr = F.relu(layer(curr))
+        
+        # [Batch, Encoded_Size]
+        encoded_flat = curr.flatten(1)
+        encoded_input = encoded_flat
+        
+        # --- 1.5 Thalamic Gating ---
+        if self.thalamus_gate is not None and memory_input is not None:
+            if memory_input.dim() == 1: memory_input = memory_input.unsqueeze(0)
+            # Project memory to [Batch, Encoded_Size * 4]
+            encoded_memory_flat = self.memory_projection(memory_input)
+            # Reshape to [Batch, Encoded_Size, 4]
+            encoded_memory = encoded_memory_flat.view(batch_size, self.encoded_size, 4)
+            
+            chem_vec = chemicals if chemicals is not None else torch.tensor([0.5, 0.5, 0.2, 0.0], device=input_vector.device).repeat(batch_size, 1)
+            
+            # Flatten inputs for gate: [Batch, Encoded_Size*4 + Encoded_Size*4 + 4]
+            gate_input = torch.cat([encoded_input.reshape(batch_size, -1), encoded_memory.reshape(batch_size, -1), chem_vec], dim=1)
+            alpha = self.thalamus_gate(gate_input).unsqueeze(-1) # Broadcast to 4D
+            
+            encoded_input = (alpha * encoded_input) + ((1.0 - alpha) * encoded_memory)
+            if self.training:
+                encoded_input += torch.randn_like(encoded_input) * 0.01
+        
+        # --- 2. Neuromodulated Gating ---
+        if chemicals is None:
+            chemicals = torch.tensor([0.5, 0.5, 0.2, 0.0], device=input_vector.device).repeat(batch_size, 1)
+        
+        # Meta controller takes flattened input
+        meta_input = torch.cat([encoded_input.reshape(batch_size, -1), chemicals], dim=1)
+        gates = torch.sigmoid(self.meta_controller(meta_input))
+        g_reflex, g_concept, g_strategy = torch.chunk(gates, 3, dim=1)
+        
+        # --- 3. Hierarchical Update ---
+        # Block returns: State(3D), Output(2D), Prediction
+        self.h_reflex, reflex_out, p_reflex = self.reflex(encoded_input, self.h_reflex, g_reflex, dt)
+        
+        # Flash Head uses 2D output
+        flash_actions = self.flash_head(reflex_out)
+        confidence = torch.sigmoid(self.flash_confidence(reflex_out))
+        
+        self.h_concept, concept_out, p_concept = self.concept(reflex_out, self.h_concept, g_concept, dt)
+        self.h_strategy, strategy_out, p_strategy = self.strategy(concept_out, self.h_strategy, g_strategy, dt)
+        
+        # Stability: Clip hidden states (3D)
+        self.h_reflex = torch.clamp(self.h_reflex, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
+        self.h_concept = torch.clamp(self.h_concept, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
+        self.h_strategy = torch.clamp(self.h_strategy, HIDDEN_STATE_CLIP_MIN, HIDDEN_STATE_CLIP_MAX)
+        
+        # --- 4. Decoding ---
+        # Use 2D outputs for decoding
+        full_h = torch.cat([reflex_out, concept_out, strategy_out], dim=1)
+        
+        actions = self.decoder(full_h)
+        value = self.critic(full_h)
+        energy = torch.mean(torch.abs(full_h))
+        
+        flash_data = (flash_actions, confidence, p_reflex, p_concept, p_strategy, self.h_reflex, self.h_concept, self.h_strategy)
+        return actions, value, energy, flash_data
+
+    def forward_onnx(self, input_vector, chemicals, h_reflex, h_concept, h_strategy, dt=0.1):
+        batch_size = input_vector.shape[0]
+
+        # --- 1. Holographic Encoding ---
+        x = self.input_projection(input_vector)
+        x = x.view(batch_size, 1, self.base_res, self.base_res, self.base_res)
+        
+        curr = x
+        for layer in self.encoder_levels:
+            curr = F.relu(layer(curr))
+            
+        encoded_flat = curr.flatten(1)
+        encoded_input = encoded_flat
+        
+        # --- 2. Neuromodulated Gating ---
+        if chemicals is None:
+            chemicals = torch.tensor([0.5, 0.5, 0.2, 0.0], device=input_vector.device).repeat(batch_size, 1)
+        
+        meta_input = torch.cat([encoded_input.reshape(batch_size, -1), chemicals], dim=1)
+        gates = torch.sigmoid(self.meta_controller(meta_input))
+        g_reflex, g_concept, g_strategy = torch.chunk(gates, 3, dim=1)
+        
+        # --- 3. Hierarchical Update ---
+        next_h_reflex, p_reflex = self.reflex.forward_onnx(encoded_input, h_reflex, g_reflex, dt)
+        
+        flash_actions = self.flash_head(next_h_reflex.reshape(batch_size, -1))
+        confidence = torch.sigmoid(self.flash_confidence(next_h_reflex.reshape(batch_size, -1)))
+        
+        next_h_concept, p_concept = self.concept.forward_onnx(next_h_reflex, h_concept, g_concept, dt)
+        next_h_strategy, p_strategy = self.strategy.forward_onnx(next_h_concept, h_strategy, g_strategy, dt)
+        
+        # --- 4. Decoding ---
+        full_h = torch.cat([next_h_reflex, next_h_concept, next_h_strategy], dim=1)
+        full_h_flat = full_h.reshape(batch_size, -1)
+        
+        actions = self.decoder(full_h_flat)
+        value = self.critic(full_h_flat)
+        energy = torch.mean(torch.abs(full_h))
+        
+        return actions, value, energy, (flash_actions, confidence, p_reflex, p_concept, p_strategy, next_h_reflex, next_h_concept, next_h_strategy), (next_h_reflex, next_h_concept, next_h_strategy)
+
     def reset_state(self):
         self.h_reflex = None
         self.h_concept = None
@@ -496,11 +538,11 @@ class NeuromodulatedHolographicBrain(nn.Module):
         self.strategy.resize(in_size=c_size, hidden_size=s_size)
         
         device = next(self.parameters()).device
-        self.flash_head = nn.Linear(r_size, self.output_size).to(device)
-        self.flash_confidence = nn.Linear(r_size, 1).to(device)
-        self.decoder = nn.Linear(new_hidden_size, self.output_size).to(device)
-        self.intent_gate = nn.Linear(new_hidden_size, 1).to(device)
-        self.critic = nn.Linear(new_hidden_size, 1).to(device)
+        self.flash_head = nn.Linear(r_size * 4, self.output_size).to(device)
+        self.flash_confidence = nn.Linear(r_size * 4, 1).to(device)
+        self.decoder = nn.Linear(new_hidden_size * 4, self.output_size).to(device)
+        self.intent_gate = nn.Linear(new_hidden_size * 4, 1).to(device)
+        self.critic = nn.Linear(new_hidden_size * 4, 1).to(device)
         
         self.reset_state()
 
@@ -540,6 +582,15 @@ class NeuromodulatedHolographicBrain(nn.Module):
             optimizer.step()
             
             total_loss += loss.item()
-            self.detach_state()
             
         return total_loss / len(input_sequence)
+
+    def detach_state(self):
+        """Detach all internal states to truncate BPTT."""
+        if self.h_reflex is not None: self.h_reflex = self.h_reflex.detach()
+        if self.h_concept is not None: self.h_concept = self.h_concept.detach()
+        if self.h_strategy is not None: self.h_strategy = self.h_strategy.detach()
+        
+        self.reflex.detach_state()
+        self.concept.detach_state()
+        self.strategy.detach_state()

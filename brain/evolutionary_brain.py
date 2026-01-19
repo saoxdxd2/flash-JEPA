@@ -125,6 +125,18 @@ class EvolutionaryBrain:
 
     def start(self):
         print("Brain: Waking up...")
+        
+        # Neuroplasticity Check (Growth/Pruning based on yesterday's load)
+        self.check_neuroplasticity()
+        
+        self.trm.reset_state()
+        self.chemistry.reset()
+        self.stamina = 1.0
+        
+        # Reset daily metrics
+        self.daily_avg_surprise = 0.0
+        self.steps_today = 0
+        
         self.retina.start()
 
     def stop(self):
@@ -135,6 +147,67 @@ class EvolutionaryBrain:
         self.prev_action = None
         if hasattr(self.trm, 'reset_state'):
             self.trm.reset_state()
+
+    def check_neuroplasticity(self):
+        """
+        Intelligent Neuroplasticity Controller.
+        Decides whether to grow (hypertrophy) or prune (atrophy) the brain
+        based on cognitive load (surprise) and metabolic headroom (RAM).
+        """
+        if not self.genome.ENABLE_NEUROPLASTICITY:
+            return
+            
+        avg_surprise = getattr(self, 'daily_avg_surprise', 0.0)
+        current_ram_mb = get_memory_stats()['rss_mb']
+        max_ram_mb = self.genome.max_ram_mb
+        
+        print(f"Neuroplasticity Check: Surprise={avg_surprise:.4f}, RAM={current_ram_mb:.1f}/{max_ram_mb}MB")
+        
+        # 1. Growth Logic (Hypertrophy)
+        # Trigger: High Surprise (Learning new things) AND RAM Headroom
+        if avg_surprise > self.genome.GROWTH_TRIGGER_SURPRISE:
+            if current_ram_mb < max_ram_mb * 0.9: # 10% Safety Buffer
+                new_size = self.hidden_size + self.genome.GROWTH_STEP_SIZE
+                new_size = min(new_size, self.genome.MAX_HIDDEN_SIZE)
+                
+                if new_size > self.hidden_size:
+                    print(f"*** NEUROPLASTICITY: GROWTH DETECTED ***")
+                    print(f"    Reason: High Cognitive Load (Surprise {avg_surprise:.2f} > {self.genome.GROWTH_TRIGGER_SURPRISE})")
+                    print(f"    Action: Expanding Hidden Size {self.hidden_size} -> {new_size}")
+                    self.resize_brain(new_size)
+            else:
+                print(f"    Growth Inhibited: Metabolic Limit Reached (RAM > 90%)")
+                
+        # 2. Pruning Logic (Atrophy)
+        # Trigger: Low Surprise (Boredom/Stability) AND Oversized
+        elif avg_surprise < self.genome.PRUNE_TRIGGER_STABILITY:
+            if self.hidden_size > self.genome.MIN_HIDDEN_SIZE:
+                new_size = self.hidden_size - self.genome.PRUNE_STEP_SIZE
+                new_size = max(new_size, self.genome.MIN_HIDDEN_SIZE)
+                
+                if new_size < self.hidden_size:
+                    print(f"*** NEUROPLASTICITY: PRUNING DETECTED ***")
+                    print(f"    Reason: Low Cognitive Load (Surprise {avg_surprise:.2f} < {self.genome.PRUNE_TRIGGER_STABILITY})")
+                    print(f"    Action: Pruning Hidden Size {self.hidden_size} -> {new_size}")
+                    self.resize_brain(new_size)
+
+    def resize_brain(self, new_hidden_size):
+        """
+        Executes the structural resizing of the brain.
+        """
+        print(f"Resizing Brain Architecture...")
+        
+        # 1. Resize Modular Brain (TRM)
+        self.trm.resize_hidden(new_hidden_size)
+        self.hidden_size = new_hidden_size
+        self.genome.hidden_size = new_hidden_size # Persist change
+        
+        # 2. Re-initialize Optimizer (Parameters changed)
+        self.trm_optimizer = torch.optim.Adam(
+            self.trm.parameters(), 
+            lr=self.genome.learning_rate
+        )
+        print(f"Brain Resized Successfully. New Hidden Size: {self.hidden_size}")
 
     def decide(self, full_input_tensor, train_internal_rl=True, greedy=False, disable_reflex=False):
         # 1. Input Processing & Conscious Masking
@@ -182,6 +255,12 @@ class EvolutionaryBrain:
                 memory_input=boosted_input[:, 3*L : 6*L]
             )
             logits, value, energy, flash_info = res
+            
+        # Update Confidence
+        if use_onnx:
+            self.last_confidence = confidence.mean().item()
+        elif flash_info is not None and flash_info[1] is not None:
+            self.last_confidence = flash_info[1].mean().item()
             
         self.last_value = value.mean().item() if torch.is_tensor(value) else value
         surprise = getattr(self, 'last_surprise', 0.0)
@@ -709,3 +788,59 @@ class EvolutionaryBrain:
             self.trm.resize_hidden(new_hidden_size)
         # Re-init optimizer for new parameters
         self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate)
+
+    def train_cognitive_task(self, inputs, targets):
+        """
+        Trains the brain on a specific cognitive task (e.g. Copy, Recall).
+        Inputs: [Batch, Seq_Len, Task_Dim]
+        Targets: [Batch, Seq_Len, Task_Dim]
+        """
+        # 1. Pad Inputs to match Brain's Input Size
+        batch_size, seq_len, task_dim = inputs.shape
+        
+        if self.input_size > task_dim:
+            padding = torch.zeros(batch_size, seq_len, self.input_size - task_dim, device=self.device)
+            inputs_padded = torch.cat([inputs.to(self.device), padding], dim=2)
+        else:
+            inputs_padded = inputs.to(self.device)
+            
+        # 2. Forward Pass through Time
+        total_loss = 0
+        criterion = nn.MSELoss()
+        
+        # Use existing optimizer
+        if not hasattr(self, 'trm_optimizer'):
+             self.trm_optimizer = torch.optim.Adam(self.trm.parameters(), lr=self.genome.learning_rate)
+             
+        self.trm_optimizer.zero_grad()
+        
+        # Detach state to prevent backprop through previous episodes
+        if hasattr(self.trm, 'detach_state'):
+            self.trm.detach_state()
+        
+        # Iterate sequence
+        for t in range(seq_len):
+            input_t = inputs_padded[:, t, :]
+            
+            # Forward
+            # ModularBrain forward: x -> visual -> bus -> motor -> action
+            # We want to tap into the output.
+            # ModularBrain returns (action, value, energy, ...)
+            actions, value, energy, _ = self.trm(input_t)
+            
+            # 3. Calculate Loss
+            # We compare the first 'task_dim' outputs to the target
+            output_t = actions[:, :task_dim]
+            target_t = targets[:, t, :].to(self.device)
+            
+            loss = criterion(output_t, target_t)
+            total_loss += loss
+            
+        # 4. Backward
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.trm.parameters(), 1.0)
+        self.trm_optimizer.step()
+        
+        avg_loss = total_loss.item() / seq_len
+        self.last_surprise = avg_loss # Update surprise for neuroplasticity
+        return avg_loss

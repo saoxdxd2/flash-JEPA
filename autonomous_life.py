@@ -78,23 +78,83 @@ def main():
                 alive = True
                 collapsed = False
                 
+                # Task Generator
+                from brain.modules.task_generator import TaskGenerator
+                from brain.modules.visualization import VisualizationLogger
+                
+                task_gen = TaskGenerator(input_size=16, output_size=16)
+                task_gen.set_difficulty(1)
+                
+                logger = VisualizationLogger()
+                logger.log_event("SYSTEM", "Autonomous Life Started")
+                
+                tasks_completed = 0
+                avg_loss = 1.0
+                
                 while alive:
-                    result = brain.wake_cycle()
+                    # A. Cognitive Training (The "School" of Life)
+                    # Generate a task
+                    inputs, targets, meta = task_gen.generate_task()
                     
-                    if result == "COLLAPSED":
-                        print(f"\n[Age: {brain.age}] COLLAPSED FROM EXHAUSTION!")
+                    # Train
+                    loss = brain.train_cognitive_task(inputs, targets)
+                    
+                    # Update Stats
+                    avg_loss = 0.95 * avg_loss + 0.05 * loss
+                    tasks_completed += 1
+                    
+                    # Curriculum Adjustment
+                    if avg_loss < 0.1:
+                        task_gen.set_difficulty(task_gen.difficulty + 1)
+                        # Reset avg_loss to avoid instant promotion
+                        avg_loss = 0.5
+                        logger.log_event("LEVEL_UP", f"Difficulty -> {task_gen.difficulty}")
+                        print(f"\n[Level Up] Difficulty -> {task_gen.difficulty}")
+                        
+                    # B. Biological Cycle (Metabolism)
+                    brain.chemistry.energy -= 0.1 # Thinking cost
+                    brain.age += 0.01
+                    
+                    # Update Chemistry with Task Feedback
+                    brain.chemistry.update(
+                        reward_prediction_error=0.0, # No external reward yet
+                        surprise=loss, # Task Loss = Surprise
+                        pain=0.0,
+                        effort=0.1,
+                        fear=0.0,
+                        aggression=0.0
+                    )
+                    
+                    # Log State
+                    task_info = {
+                        'desc': meta['desc'],
+                        'difficulty': task_gen.difficulty,
+                        'loss': loss,
+                        'avg_loss': avg_loss,
+                        'confidence': getattr(brain, 'last_confidence', 0.0)
+                    }
+                    logger.log_step(brain, task_info)
+                    
+                    if brain.chemistry.energy <= 0:
+                        logger.log_event("DEATH", "Collapsed from exhaustion")
+                        print(f"\n[Age: {brain.age:.1f}] COLLAPSED FROM EXHAUSTION!")
                         alive = False
                         collapsed = True
-                    elif result is not None:
-                         if time.time() % 2 < 0.1:
-                            chem = brain.chemistry
-                            print(f"Gen: {generation} | Age: {brain.age} | E: {chem.energy:.1f} | Cost: {brain.last_energy_cost:.2f} | Act: {result}", end='\r', flush=True)
-                            pass
+                        
+                    # Sleep / Eat
+                    if brain.chemistry.energy < 20:
+                        # Auto-Eat
+                        brain.chemistry.energy += 50
+                        logger.log_event("METABOLISM", "Eating (Energy Restored)")
+                        
+                    if tasks_completed % 10 == 0:
+                        print(f"Gen: {generation} | Age: {brain.age:.1f} | Diff: {task_gen.difficulty} | Loss: {avg_loss:.4f} | Task: {meta['desc']}", end='\r', flush=True)
                     
-                    if result == "WAITING_FOR_RETINA":
-                        if time.time() % 5 < 0.1:
-                            print("Waiting for Retina...", end='\r')
-                    
+                    # Periodic Save
+                    if tasks_completed % 500 == 0:
+                        brain.save_model(model_path)
+                        logger.log_event("SYSTEM", "Model Saved")
+                        
                     time.sleep(0.01)
                     
                 

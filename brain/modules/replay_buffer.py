@@ -107,9 +107,13 @@ class PrioritizedReplayBuffer:
         if torch.is_tensor(action): action = action.detach().cpu().numpy()
         if torch.is_tensor(reward): reward = reward.item()
         
+        # Handle scalars (int/float) that don't have .shape
+        state_shape = state.shape if hasattr(state, 'shape') else ()
+        action_shape = action.shape if hasattr(action, 'shape') else ()
+        
         # Initialize storage on first run
         if self.states is None:
-            self._init_storage(state.shape, action.shape)
+            self._init_storage(state_shape, action_shape)
             
         # Store in arrays
         self.states[self.pos] = state
